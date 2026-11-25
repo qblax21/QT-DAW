@@ -1,0 +1,16 @@
+[package]
+name = "qtdaw-engine"
+description = "QT DAW audio engine: device I/O, routing and metering"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+# ASIO is how pro interfaces (X32, AudioBox, etc.) reach low latency on Windows.
+# It needs the Steinberg ASIO SDK and LLVM/clang at build time, so it is opt-in.
+asio = ["cpal/asio"]
+
+[dependencies]
+anyhow = "1.0.105"
+cpal = "0.18.2"
+ringbuf = "0.6.0"
