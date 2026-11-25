@@ -27,8 +27,12 @@ pub struct Session {
     pub tempo: f32,
     pub beats_per_bar: u32,
     pub master_db: f32,
+    /// Shared by tracks and buses, so every id is unique. Starts at 1: id 0 means "Master".
     pub next_id: u64,
     pub tracks: Vec<TrackModel>,
+    /// Aux buses: tracks can be routed into them (e.g. a drum bus) or send a copy to them
+    /// (e.g. a reverb bus). Buses always feed the master.
+    pub buses: Vec<BusModel>,
 }
 
 impl Default for Session {
@@ -42,8 +46,43 @@ impl Default for Session {
             master_db: 0.0,
             next_id: 1,
             tracks: Vec::new(),
+            buses: Vec::new(),
         }
     }
+}
+
+/// The id that means "the master output" wherever a track's output is stored.
+pub const MASTER: u64 = 0;
+
+/// How many buses a session can have (the engine keeps a mixing buffer for each).
+pub const MAX_BUSES: usize = 32;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BusModel {
+    pub id: u64,
+    pub name: String,
+    pub volume_db: f32,
+    /// Balance: -1.0 = left only, 0.0 = both, 1.0 = right only.
+    pub pan: f32,
+    pub mute: bool,
+    pub solo: bool,
+}
+
+impl Default for BusModel {
+    fn default() -> Self {
+        Self { id: 0, name: String::new(), volume_db: 0.0, pan: 0.0, mute: false, solo: false }
+    }
+}
+
+/// A copy of a track's signal sent to a bus, at its own level.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SendModel {
+    pub bus: u64,
+    pub level_db: f32,
+    /// Pre-fader sends ignore the track's volume fader (useful for headphone mixes).
+    #[serde(default)]
+    pub pre_fader: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +97,9 @@ pub struct TrackModel {
     pub pan: f32,
     pub mute: bool,
     pub solo: bool,
+    /// Where the track plays to: [`MASTER`] or a bus id.
+    pub output: u64,
+    pub sends: Vec<SendModel>,
     /// Record-arm is not saved: reopening a session should never start recording a track
     /// you forgot about.
     #[serde(skip)]
@@ -78,6 +120,8 @@ impl Default for TrackModel {
             pan: 0.0,
             mute: false,
             solo: false,
+            output: MASTER,
+            sends: Vec::new(),
             armed: false,
             clips: Vec::new(),
             takes: 0,
@@ -109,6 +153,38 @@ impl Session {
 
     pub fn track_mut(&mut self, id: u64) -> Option<&mut TrackModel> {
         self.tracks.iter_mut().find(|t| t.id == id)
+    }
+
+    /// Add a bus (`None` = "Bus N"). Returns `None` when the session already has
+    /// [`MAX_BUSES`].
+    pub fn add_bus(&mut self, name: Option<String>) -> Option<u64> {
+        if self.buses.len() >= MAX_BUSES {
+            return None;
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        let name = name.unwrap_or_else(|| format!("Bus {}", self.buses.len() + 1));
+        self.buses.push(BusModel { id, name, ..Default::default() });
+        Some(id)
+    }
+
+    /// Remove a bus. Tracks that played into it go back to the master; sends to it are removed.
+    pub fn remove_bus(&mut self, id: u64) {
+        self.buses.retain(|b| b.id != id);
+        for t in &mut self.tracks {
+            if t.output == id {
+                t.output = MASTER;
+            }
+            t.sends.retain(|s| s.bus != id);
+        }
+    }
+
+    /// Display name for an output id ("Master" or the bus name).
+    pub fn output_name(&self, id: u64) -> &str {
+        if id == MASTER {
+            return "Master";
+        }
+        self.buses.iter().find(|b| b.id == id).map_or("Master", |b| b.name.as_str())
     }
 
     /// Write `session.qtdaw` atomically (write a temp file, then rename), so a crash
@@ -187,6 +263,33 @@ mod tests {
         assert_eq!(loaded.tracks[0].takes, 1);
         assert!(!loaded.tracks[0].armed);
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn removing_a_bus_reroutes_tracks() {
+        let mut s = Session::new("Test", 48_000);
+        let t = s.add_track(None, 0);
+        let bus = s.add_bus(Some("Drums".into())).unwrap();
+        let verb = s.add_bus(None).unwrap();
+        assert_ne!(bus, t);
+        let track = s.track_mut(t).unwrap();
+        track.output = bus;
+        track.sends.push(SendModel { bus, level_db: 0.0, pre_fader: false });
+        track.sends.push(SendModel { bus: verb, level_db: -10.0, pre_fader: false });
+        assert_eq!(s.output_name(bus), "Drums");
+        s.remove_bus(bus);
+        let track = s.track_mut(t).unwrap();
+        assert_eq!(track.output, MASTER);
+        assert_eq!(track.sends.len(), 1);
+        assert_eq!(s.output_name(verb), "Bus 2");
+    }
+
+    #[test]
+    fn old_sessions_still_load() {
+        let json = r#"{"name":"Old","tracks":[{"id":1,"name":"Kick","clips":[]}]}"#;
+        let s: Session = serde_json::from_str(json).unwrap();
+        assert_eq!(s.tracks[0].output, MASTER);
+        assert!(s.buses.is_empty());
     }
 
     #[test]

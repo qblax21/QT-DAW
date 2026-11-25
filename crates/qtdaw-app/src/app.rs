@@ -9,14 +9,52 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use qtdaw_engine::clip::ClipAudio;
 use qtdaw_engine::devices::{self, DeviceInfo};
-use qtdaw_engine::engine::{ClipRt, Engine, EngineConfig, Request, Shared, TrackRt, db_to_gain};
+use qtdaw_engine::engine::{
+    AtomicF32, BusRt, ClipRt, Engine, EngineConfig, Request, SendRt, Shared, TrackRt, db_to_gain,
+};
 use qtdaw_engine::recorder::{RecorderEvent, TakeSpec};
 use qtdaw_engine::session::{self, ClipModel, Session};
 
 use crate::settings::Settings;
 
+/// What a meter shows: the level (jumps up, falls smoothly), a peak-hold line that waits
+/// before falling, and a clip light that stays on until clicked.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MeterState {
+    pub level: f32,
+    pub hold: f32,
+    hold_since: f64,
+    pub clipped: bool,
+}
+
+impl MeterState {
+    const FALL: f32 = 0.85;
+    const HOLD_SECS: f64 = 1.5;
+
+    pub fn update(&mut self, peak: f32, now: f64) {
+        self.level = peak.max(self.level * Self::FALL);
+        if self.level >= self.hold {
+            self.hold = self.level;
+            self.hold_since = now;
+        } else if now - self.hold_since > Self::HOLD_SECS {
+            self.hold = (self.hold * 0.92).max(self.level);
+        }
+        if peak > 1.0 {
+            self.clipped = true;
+        }
+    }
+}
+
+/// Which big view fills the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MainView {
+    Tracks,
+    Mixer,
+}
+
 /// UI-only state (zoom, scroll, open dialogs...).
 pub struct View {
+    pub main: MainView,
     /// Timeline zoom.
     pub px_per_sec: f32,
     /// Seconds of timeline hidden off the left edge.
@@ -27,10 +65,11 @@ pub struct View {
     pub show_new: bool,
     pub new_name: String,
     pub new_rate: u32,
-    /// Smoothed meter levels for display.
-    pub input_levels: Vec<f32>,
-    pub track_levels: HashMap<u64, f32>,
-    pub master_levels: [f32; 2],
+    /// Meter levels for display.
+    pub input_levels: Vec<MeterState>,
+    pub track_levels: HashMap<u64, MeterState>,
+    pub bus_levels: HashMap<u64, [MeterState; 2]>,
+    pub master_levels: [MeterState; 2],
     pub devices: Vec<DeviceInfo>,
     pub sessions: Vec<PathBuf>,
     /// Settings being edited in the Audio Settings window.
@@ -48,6 +87,8 @@ pub struct QtDaw {
     pub dirty: bool,
     /// Engine-side mirror of each track, same order as `session.tracks`.
     pub rts: Vec<Arc<TrackRt>>,
+    /// Engine-side mirror of each bus, same order as `session.buses`.
+    pub bus_rts: Vec<Arc<BusRt>>,
     /// Loaded audio, keyed by the clip's file path relative to the session folder.
     pub audio: HashMap<String, Arc<ClipAudio>>,
     pub view: View,
@@ -66,8 +107,10 @@ impl QtDaw {
             folder: None,
             dirty: false,
             rts: Vec::new(),
+            bus_rts: Vec::new(),
             audio: HashMap::new(),
             view: View {
+                main: MainView::Tracks,
                 px_per_sec: 40.0,
                 scroll_sec: 0.0,
                 selected_clip: None,
@@ -78,7 +121,8 @@ impl QtDaw {
                 new_rate: 48_000,
                 input_levels: Vec::new(),
                 track_levels: HashMap::new(),
-                master_levels: [0.0; 2],
+                bus_levels: HashMap::new(),
+                master_levels: [MeterState::default(); 2],
                 devices: Vec::new(),
                 sessions: Vec::new(),
                 draft: settings.clone(),
@@ -128,7 +172,7 @@ impl QtDaw {
         };
         match Engine::start(&cfg, self.shared.clone()) {
             Ok(engine) => {
-                self.view.input_levels = vec![0.0; engine.in_channels];
+                self.view.input_levels = vec![MeterState::default(); engine.in_channels];
                 self.engine = Some(engine);
                 self.engine_error = None;
             }
@@ -163,7 +207,44 @@ impl QtDaw {
             rt.pan.set(t.pan);
             rt.mute.store(t.mute, Ordering::Relaxed);
             rt.solo.store(t.solo, Ordering::Relaxed);
+            rt.output.store(t.output, Ordering::Relaxed);
+
+            // Sends: swap the list only when a bus or pre/post changed; levels are atomic.
+            let current = rt.sends.load();
+            let same_layout = current.len() == t.sends.len()
+                && current.iter().zip(&t.sends).all(|(a, b)| a.bus == b.bus && a.pre_fader == b.pre_fader);
+            if same_layout {
+                for (a, b) in current.iter().zip(&t.sends) {
+                    a.gain.set(db_to_gain(b.level_db));
+                }
+            } else {
+                let sends = t
+                    .sends
+                    .iter()
+                    .map(|s| SendRt { bus: s.bus, pre_fader: s.pre_fader, gain: AtomicF32::new(db_to_gain(s.level_db)) })
+                    .collect();
+                rt.sends.store(Arc::new(sends));
+            }
         }
+        for (b, rt) in self.session.buses.iter().zip(&self.bus_rts) {
+            rt.gain.set(db_to_gain(b.volume_db));
+            rt.pan.set(b.pan);
+            rt.mute.store(b.mute, Ordering::Relaxed);
+            rt.solo.store(b.solo, Ordering::Relaxed);
+        }
+    }
+
+    /// Rebuild the engine's bus list after buses were added or removed.
+    pub fn rebuild_buses(&mut self) {
+        let mut old: HashMap<u64, Arc<BusRt>> = self.bus_rts.drain(..).map(|r| (r.id, r)).collect();
+        self.bus_rts = self
+            .session
+            .buses
+            .iter()
+            .map(|b| old.remove(&b.id).unwrap_or_else(|| Arc::new(BusRt::new(b.id))))
+            .collect();
+        self.shared.buses.store(Arc::new(self.bus_rts.clone()));
+        self.sync_engine();
     }
 
     /// Rebuild the engine's track list after tracks were added, removed or reordered.
@@ -311,6 +392,26 @@ impl QtDaw {
         self.rebuild_tracks();
     }
 
+    /// Add a bus and return its id (`None` if the session is full).
+    pub fn add_bus(&mut self) -> Option<u64> {
+        let id = self.session.add_bus(None);
+        match id {
+            Some(_) => {
+                self.dirty = true;
+                self.rebuild_buses();
+            }
+            None => self.say(format!("A session can have up to {} buses.", session::MAX_BUSES)),
+        }
+        id
+    }
+
+    pub fn delete_bus(&mut self, id: u64) {
+        self.session.remove_bus(id);
+        self.view.bus_levels.remove(&id);
+        self.dirty = true;
+        self.rebuild_buses();
+    }
+
     /// Remove the selected clip from its track. The WAV file stays on disk.
     pub fn delete_selected_clip(&mut self) {
         let Some((track_id, idx)) = self.view.selected_clip.take() else { return };
@@ -368,6 +469,7 @@ impl QtDaw {
         self.view.scroll_sec = 0.0;
         self.shared.locate(0);
         self.rebuild_tracks();
+        self.rebuild_buses();
         if let Err(e) = self.ensure_folder() {
             self.say(format!("Couldn't create the session folder: {e:#}"));
         }
@@ -400,6 +502,7 @@ impl QtDaw {
         self.view.scroll_sec = 0.0;
         self.shared.locate(0);
         self.rebuild_tracks();
+        self.rebuild_buses();
         self.settings.last_session = Some(folder.to_path_buf());
         self.settings.save();
         if rate_changed && self.engine.is_some() {
@@ -419,22 +522,27 @@ impl QtDaw {
         self.poll_recorder();
         self.sync_engine();
 
-        // Meters: jump up instantly, fall back smoothly.
-        let fall = 0.85;
+        let now = ctx.input(|i| i.time);
         if let Some(engine) = &self.engine {
             let peaks = engine.meters.take_peaks();
-            self.view.input_levels.resize(peaks.len(), 0.0);
-            for (d, p) in self.view.input_levels.iter_mut().zip(peaks) {
-                *d = p.max(*d * fall);
+            self.view.input_levels.resize(peaks.len(), MeterState::default());
+            for (m, p) in self.view.input_levels.iter_mut().zip(peaks) {
+                m.update(p, now);
             }
         }
         for rt in &self.rts {
-            let d = self.view.track_levels.entry(rt.id).or_insert(0.0);
-            *d = rt.take_peak().max(*d * fall);
+            self.view.track_levels.entry(rt.id).or_default().update(rt.take_peak(), now);
         }
-        let m = self.shared.take_master_peaks();
+        for rt in &self.bus_rts {
+            let peaks = rt.take_peaks();
+            let m = self.view.bus_levels.entry(rt.id).or_default();
+            for i in 0..2 {
+                m[i].update(peaks[i], now);
+            }
+        }
+        let peaks = self.shared.take_master_peaks();
         for i in 0..2 {
-            self.view.master_levels[i] = m[i].max(self.view.master_levels[i] * fall);
+            self.view.master_levels[i].update(peaks[i], now);
         }
 
         // Keep ~30 fps for meters and the playhead.

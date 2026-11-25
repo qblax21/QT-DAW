@@ -60,6 +60,11 @@ fn main() {
     println!("cargo:rustc-link-lib=dylib=user32");
     println!("cargo:rustc-link-search={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=asio");
+    // QT DAW patch: the C++ runtime link line normally comes from `cc` inside create_lib,
+    // so it went missing whenever this script re-ran with libasio.a already built.
+    if !is_msvc {
+        println!("cargo:rustc-link-lib=stdc++");
+    }
     println!("cargo:rustc-cfg=asio");
 
     // Check if bindings exist

@@ -26,6 +26,7 @@ use crate::devices::{self, device_name};
 use crate::io;
 use crate::meter::Meters;
 use crate::recorder::Recorder;
+use crate::session::{MASTER, MAX_BUSES};
 
 /// An `f32` that can be shared between threads (stored as its bit pattern).
 #[derive(Debug, Default)]
@@ -55,6 +56,15 @@ pub struct ClipRt {
     pub samples: Arc<Vec<f32>>,
 }
 
+/// A send as the audio thread sees it. The bus and pre/post choice only change by swapping
+/// the whole list; the level is atomic so turning a send knob never reallocates.
+#[derive(Debug)]
+pub struct SendRt {
+    pub bus: u64,
+    pub pre_fader: bool,
+    pub gain: AtomicF32,
+}
+
 /// A track as the audio thread sees it. The UI writes these fields; the engine reads them.
 pub struct TrackRt {
     pub id: u64,
@@ -64,6 +74,9 @@ pub struct TrackRt {
     pub pan: AtomicF32,
     pub mute: AtomicBool,
     pub solo: AtomicBool,
+    /// [`MASTER`] or the id of the bus this track plays into.
+    pub output: AtomicU64,
+    pub sends: ArcSwap<Vec<SendRt>>,
     pub clips: ArcSwap<Vec<ClipRt>>,
     peak: AtomicU32,
 }
@@ -78,6 +91,8 @@ impl TrackRt {
             pan: AtomicF32::new(0.0),
             mute: AtomicBool::new(false),
             solo: AtomicBool::new(false),
+            output: AtomicU64::new(MASTER),
+            sends: ArcSwap::from_pointee(Vec::new()),
             clips: ArcSwap::from_pointee(Vec::new()),
             peak: AtomicU32::new(0),
         }
@@ -86,6 +101,35 @@ impl TrackRt {
     /// Loudest post-fader sample since the last call.
     pub fn take_peak(&self) -> f32 {
         f32::from_bits(self.peak.swap(0, Ordering::Relaxed))
+    }
+}
+
+/// A stereo aux bus as the audio thread sees it.
+pub struct BusRt {
+    pub id: u64,
+    pub gain: AtomicF32,
+    /// Balance, -1..1.
+    pub pan: AtomicF32,
+    pub mute: AtomicBool,
+    pub solo: AtomicBool,
+    peak: [AtomicU32; 2],
+}
+
+impl BusRt {
+    pub fn new(id: u64) -> Self {
+        Self {
+            id,
+            gain: AtomicF32::new(1.0),
+            pan: AtomicF32::new(0.0),
+            mute: AtomicBool::new(false),
+            solo: AtomicBool::new(false),
+            peak: [AtomicU32::new(0), AtomicU32::new(0)],
+        }
+    }
+
+    /// Loudest (left, right) output samples since the last call.
+    pub fn take_peaks(&self) -> [f32; 2] {
+        [0, 1].map(|i| f32::from_bits(self.peak[i].swap(0, Ordering::Relaxed)))
     }
 }
 
@@ -116,6 +160,8 @@ pub mod rec_state {
 /// [`Engine`], so changing audio device keeps the tracks.
 pub struct Shared {
     pub tracks: ArcSwap<Vec<Arc<TrackRt>>>,
+    /// Only the first [`MAX_BUSES`] are mixed.
+    pub buses: ArcSwap<Vec<Arc<BusRt>>>,
     pub tempo: AtomicF32,
     pub beats_per_bar: AtomicU32,
     pub click_on: AtomicBool,
@@ -145,6 +191,7 @@ impl Default for Shared {
     fn default() -> Self {
         Self {
             tracks: ArcSwap::from_pointee(Vec::new()),
+            buses: ArcSwap::from_pointee(Vec::new()),
             tempo: AtomicF32::new(120.0),
             beats_per_bar: AtomicU32::new(4),
             click_on: AtomicBool::new(true),
@@ -271,28 +318,16 @@ impl Engine {
             )?
         };
 
-        let mut rt = Rt {
-            shared: shared.clone(),
-            meters: meters.clone(),
-            in_ch,
-            out_ch,
-            sr: cfg.sample_rate as f64,
+        let mut rt = Rt::new(
+            shared.clone(),
+            meters.clone(),
+            (in_ch, out_ch),
+            cfg.sample_rate as f64,
             in_cons,
             rec_prod,
             input_started,
             input_latency,
-            out_latency: 0,
-            ring_latency: 0,
-            in_buf: vec![0.0; 8192 * in_ch],
-            track_buf: vec![0.0; 8192],
-            mix_l: vec![0.0; 8192],
-            mix_r: vec![0.0; 8192],
-            mode: Mode::Stopped,
-            playhead: shared.playhead.load(Ordering::Acquire),
-            play_start: 0,
-            count_pos: 0,
-            count_len: 0,
-        };
+        );
         let output = io::build_output(
             &out_dev,
             out_cfg,
@@ -355,6 +390,10 @@ struct Rt {
     track_buf: Vec<f32>,
     mix_l: Vec<f32>,
     mix_r: Vec<f32>,
+    /// One stereo mixing buffer per bus, allocated up front so adding a bus never
+    /// allocates on the audio thread.
+    bus_l: Vec<Vec<f32>>,
+    bus_r: Vec<Vec<f32>>,
     mode: Mode,
     playhead: i64,
     /// Where playback started, so Stop can return there.
@@ -363,7 +402,47 @@ struct Rt {
     count_len: i64,
 }
 
+const START_BLOCK: usize = 8192;
+
 impl Rt {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        shared: Arc<Shared>,
+        meters: Arc<Meters>,
+        (in_ch, out_ch): (usize, usize),
+        sr: f64,
+        in_cons: HeapCons<f32>,
+        rec_prod: HeapProd<f32>,
+        input_started: Arc<AtomicBool>,
+        input_latency: Arc<AtomicU64>,
+    ) -> Self {
+        let playhead = shared.playhead.load(Ordering::Acquire);
+        Self {
+            shared,
+            meters,
+            in_ch,
+            out_ch,
+            sr,
+            in_cons,
+            rec_prod,
+            input_started,
+            input_latency,
+            out_latency: 0,
+            ring_latency: 0,
+            in_buf: vec![0.0; START_BLOCK * in_ch],
+            track_buf: vec![0.0; START_BLOCK],
+            mix_l: vec![0.0; START_BLOCK],
+            mix_r: vec![0.0; START_BLOCK],
+            bus_l: vec![vec![0.0; START_BLOCK]; MAX_BUSES],
+            bus_r: vec![vec![0.0; START_BLOCK]; MAX_BUSES],
+            mode: Mode::Stopped,
+            playhead,
+            play_start: 0,
+            count_pos: 0,
+            count_len: 0,
+        }
+    }
+
     fn process(&mut self, out: &mut [f32], out_latency: Duration) {
         let n = out.len() / self.out_ch;
         self.out_latency = duration_frames(out_latency, self.sr as usize);
@@ -373,6 +452,9 @@ impl Rt {
             self.track_buf.resize(n, 0.0);
             self.mix_l.resize(n, 0.0);
             self.mix_r.resize(n, 0.0);
+            for b in self.bus_l.iter_mut().chain(self.bus_r.iter_mut()) {
+                b.resize(n, 0.0);
+            }
         }
 
         // 1. Pull one block of live input.
@@ -513,13 +595,36 @@ impl Rt {
     /// Render `len` frames starting at frame `off` of the current block.
     fn render(&mut self, off: usize, len: usize) {
         let advancing = matches!(self.mode, Mode::Playing | Mode::Recording);
-        let mix_l = &mut self.mix_l[off..off + len];
-        let mix_r = &mut self.mix_r[off..off + len];
-        mix_l.fill(0.0);
-        mix_r.fill(0.0);
+        let seg = off..off + len;
+        self.mix_l[seg.clone()].fill(0.0);
+        self.mix_r[seg.clone()].fill(0.0);
 
         let tracks = self.shared.tracks.load();
-        let any_solo = tracks.iter().any(|t| t.solo.load(Ordering::Relaxed));
+        let buses_guard = self.shared.buses.load();
+        let buses = &buses_guard[..buses_guard.len().min(MAX_BUSES)];
+        for i in 0..buses.len() {
+            self.bus_l[i][seg.clone()].fill(0.0);
+            self.bus_r[i][seg.clone()].fill(0.0);
+        }
+        let bus_index = |id: u64| buses.iter().position(|b| b.id == id);
+        let bus_soloed = |i: Option<usize>| i.is_some_and(|i| buses[i].solo.load(Ordering::Relaxed));
+
+        // Solo: with anything soloed, you hear soloed tracks, soloed buses (and the tracks
+        // feeding them), and the buses a soloed track feeds (so its reverb stays on).
+        let mut fed_by_solo = [false; MAX_BUSES];
+        let mut any_solo = buses.iter().any(|b| b.solo.load(Ordering::Relaxed));
+        for t in tracks.iter().filter(|t| t.solo.load(Ordering::Relaxed)) {
+            any_solo = true;
+            if let Some(i) = bus_index(t.output.load(Ordering::Relaxed)) {
+                fed_by_solo[i] = true;
+            }
+            for s in t.sends.load().iter() {
+                if let Some(i) = bus_index(s.bus) {
+                    fed_by_solo[i] = true;
+                }
+            }
+        }
+
         for t in tracks.iter() {
             let tb = &mut self.track_buf[..len];
             tb.fill(0.0);
@@ -533,20 +638,54 @@ impl Rt {
                 render_clips(&t.clips.load(), self.playhead, tb);
             }
 
-            let audible = !t.mute.load(Ordering::Relaxed) && (!any_solo || t.solo.load(Ordering::Relaxed));
-            let gain = if audible { t.gain.get() } else { 0.0 };
-            // Constant-power pan: a centered track is -3 dB in each speaker.
-            let angle = (t.pan.get().clamp(-1.0, 1.0) + 1.0) * std::f32::consts::FRAC_PI_4;
-            let (gl, gr) = (gain * angle.cos(), gain * angle.sin());
-            let mut peak = 0.0f32;
-            for i in 0..len {
-                let s = tb[i];
-                peak = peak.max((s * gain).abs());
-                mix_l[i] += s * gl;
-                mix_r[i] += s * gr;
-            }
+            let muted = t.mute.load(Ordering::Relaxed);
+            let soloed = t.solo.load(Ordering::Relaxed);
+            let fader = t.gain.get();
+            let pan = pan_gains(t.pan.get());
+
+            // Main output.
+            let out_idx = bus_index(t.output.load(Ordering::Relaxed));
+            let audible = !muted && (!any_solo || soloed || bus_soloed(out_idx));
+            let gain = if audible { fader } else { 0.0 };
+            let (dl, dr) = match out_idx {
+                Some(i) => (&mut self.bus_l[i][seg.clone()], &mut self.bus_r[i][seg.clone()]),
+                None => (&mut self.mix_l[seg.clone()], &mut self.mix_r[seg.clone()]),
+            };
+            let peak = mix_into(tb, gain, pan, dl, dr);
             t.peak.fetch_max(peak.to_bits(), Ordering::Relaxed);
+
+            // Sends.
+            for s in t.sends.load().iter() {
+                let Some(i) = bus_index(s.bus) else { continue };
+                if muted || (any_solo && !soloed && !bus_soloed(Some(i))) {
+                    continue;
+                }
+                let gain = s.gain.get() * if s.pre_fader { 1.0 } else { fader };
+                mix_into(tb, gain, pan, &mut self.bus_l[i][seg.clone()], &mut self.bus_r[i][seg.clone()]);
+            }
         }
+
+        // Buses into the master.
+        for (i, b) in buses.iter().enumerate() {
+            let audible = !b.mute.load(Ordering::Relaxed)
+                && (!any_solo || b.solo.load(Ordering::Relaxed) || fed_by_solo[i]);
+            let gain = if audible { b.gain.get() } else { 0.0 };
+            let bal = b.pan.get().clamp(-1.0, 1.0);
+            let (gl, gr) = (gain * (1.0 - bal).min(1.0), gain * (1.0 + bal).min(1.0));
+            let (mut pl, mut pr) = (0.0f32, 0.0f32);
+            for j in seg.clone() {
+                let l = self.bus_l[i][j] * gl;
+                let r = self.bus_r[i][j] * gr;
+                pl = pl.max(l.abs());
+                pr = pr.max(r.abs());
+                self.mix_l[j] += l;
+                self.mix_r[j] += r;
+            }
+            b.peak[0].fetch_max(pl.to_bits(), Ordering::Relaxed);
+            b.peak[1].fetch_max(pr.to_bits(), Ordering::Relaxed);
+        }
+        drop(buses_guard);
+        drop(tracks);
 
         if self.mode == Mode::Recording {
             let chunk = &self.in_buf[off * self.in_ch..(off + len) * self.in_ch];
@@ -591,6 +730,26 @@ impl Rt {
     }
 }
 
+/// Constant-power pan: a centered track is -3 dB in each speaker, so it sounds equally
+/// loud wherever you pan it.
+fn pan_gains(pan: f32) -> (f32, f32) {
+    let angle = (pan.clamp(-1.0, 1.0) + 1.0) * std::f32::consts::FRAC_PI_4;
+    (angle.cos(), angle.sin())
+}
+
+/// Add mono `src` x `gain` into a stereo pair, panned. Returns the loudest sample added
+/// (before panning), for the meter.
+fn mix_into(src: &[f32], gain: f32, (pl, pr): (f32, f32), dl: &mut [f32], dr: &mut [f32]) -> f32 {
+    let (gl, gr) = (gain * pl, gain * pr);
+    let mut peak = 0.0f32;
+    for ((s, l), r) in src.iter().zip(dl.iter_mut()).zip(dr.iter_mut()) {
+        peak = peak.max((s * gain).abs());
+        *l += s * gl;
+        *r += s * gr;
+    }
+    peak
+}
+
 /// Copy the clips overlapping `[pos, pos + out.len())` into `out`. Later clips overwrite
 /// earlier ones, so the newest take is the one you hear.
 fn render_clips(clips: &[ClipRt], pos: i64, out: &mut [f32]) {
@@ -619,6 +778,111 @@ mod tests {
         let mut out = vec![0.0; 6];
         render_clips(&[a, b], 2, &mut out);
         assert_eq!(out, vec![1.0, 1.0, 2.0, 2.0, 2.0, 1.0]);
+    }
+
+    /// An engine core with no device behind it, already playing from frame 0.
+    fn test_rt(shared: &Arc<Shared>) -> Rt {
+        let (_in_prod, in_cons) = HeapRb::<f32>::new(64).split();
+        let (rec_prod, _rec_cons) = HeapRb::<f32>::new(64).split();
+        shared.click_on.store(false, Ordering::Relaxed);
+        let mut rt = Rt::new(
+            shared.clone(),
+            Arc::new(Meters::new(1)),
+            (1, 2),
+            48_000.0,
+            in_cons,
+            rec_prod,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
+        );
+        rt.set_mode(Mode::Playing);
+        rt
+    }
+
+    /// A track playing a constant 1.0, routed to `output`.
+    fn dc_track(id: u64, output: u64) -> Arc<TrackRt> {
+        let t = TrackRt::new(id);
+        t.output.store(output, Ordering::Relaxed);
+        t.clips.store(Arc::new(vec![ClipRt { start: 0, samples: Arc::new(vec![1.0; 1000]) }]));
+        Arc::new(t)
+    }
+
+    /// Render one block and return the first (left, right) output frame.
+    fn first_frame(rt: &mut Rt) -> (f32, f32) {
+        let mut out = vec![0.0; 2 * 16];
+        rt.process(&mut out, Duration::ZERO);
+        (out[0], out[1])
+    }
+
+    const CENTER: f32 = std::f32::consts::FRAC_1_SQRT_2;
+
+    fn close(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1e-5
+    }
+
+    #[test]
+    fn track_into_bus_into_master() {
+        let shared = Arc::new(Shared::default());
+        let bus = Arc::new(BusRt::new(10));
+        bus.gain.set(0.5);
+        shared.buses.store(Arc::new(vec![bus.clone()]));
+        shared.tracks.store(Arc::new(vec![dc_track(1, 10)]));
+        let mut rt = test_rt(&shared);
+        let (l, r) = first_frame(&mut rt);
+        assert!(close(l, 0.5 * CENTER) && close(r, 0.5 * CENTER), "{l} {r}");
+        assert!(close(bus.take_peaks()[0], 0.5 * CENTER));
+    }
+
+    #[test]
+    fn post_and_pre_fader_sends() {
+        let shared = Arc::new(Shared::default());
+        shared.buses.store(Arc::new(vec![Arc::new(BusRt::new(10))]));
+        let t = dc_track(1, MASTER);
+        t.gain.set(0.5);
+        t.sends.store(Arc::new(vec![SendRt { bus: 10, pre_fader: false, gain: AtomicF32::new(0.5) }]));
+        shared.tracks.store(Arc::new(vec![t.clone()]));
+        let mut rt = test_rt(&shared);
+        // Dry 0.5 + post-fader send 0.5 x 0.5.
+        let (l, _) = first_frame(&mut rt);
+        assert!(close(l, (0.5 + 0.25) * CENTER), "{l}");
+
+        t.sends.store(Arc::new(vec![SendRt { bus: 10, pre_fader: true, gain: AtomicF32::new(0.5) }]));
+        let (l, _) = first_frame(&mut rt);
+        assert!(close(l, (0.5 + 0.5) * CENTER), "{l}");
+    }
+
+    #[test]
+    fn solo_keeps_the_soloed_tracks_bus() {
+        let shared = Arc::new(Shared::default());
+        shared.buses.store(Arc::new(vec![Arc::new(BusRt::new(10))]));
+        let a = dc_track(1, 10);
+        let b = dc_track(2, MASTER);
+        a.solo.store(true, Ordering::Relaxed);
+        shared.tracks.store(Arc::new(vec![a.clone(), b.clone()]));
+        let mut rt = test_rt(&shared);
+        // Only A, through its bus.
+        let (l, _) = first_frame(&mut rt);
+        assert!(close(l, CENTER), "{l}");
+
+        // Soloing the bus instead: A plays (it feeds the bus), B on the master is silent.
+        a.solo.store(false, Ordering::Relaxed);
+        shared.buses.load()[0].solo.store(true, Ordering::Relaxed);
+        let (l, _) = first_frame(&mut rt);
+        assert!(close(l, CENTER), "{l}");
+
+        // Muting the bus silences everything.
+        shared.buses.load()[0].mute.store(true, Ordering::Relaxed);
+        let (l, _) = first_frame(&mut rt);
+        assert!(close(l, 0.0), "{l}");
+    }
+
+    #[test]
+    fn missing_bus_falls_back_to_master() {
+        let shared = Arc::new(Shared::default());
+        shared.tracks.store(Arc::new(vec![dc_track(1, 99)]));
+        let mut rt = test_rt(&shared);
+        let (l, _) = first_frame(&mut rt);
+        assert!(close(l, CENTER), "{l}");
     }
 
     #[test]

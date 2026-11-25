@@ -10,7 +10,7 @@ and mixing/mastering, with a Claude MCP server so Claude can do first-pass mixes
 |---|---|
 | **0. Hardware probe** (done) | Project setup; QT DAW sees your interface over ASIO and meters every input live |
 | **1. Recorder** (done) | App window; record any number of armed tracks to disk, playback, click + count-in, tempo, input monitoring, volume/pan/mute/solo, save/open sessions |
-| 2. Mixer | Mixer view, buses, sends, better meters |
+| **2. Mixer** (done) | Mixer view (X), aux buses, pre/post-fader sends, track output routing, console-style faders, meters with peak hold and clip lights |
 | 3. Built-in effects | EQ, compressor, gate, de-esser, reverb, delay, limiter, vocal chain presets |
 | 4. Claude MCP | Analysis (loudness, spectrum, masking) + mix controls for Claude |
 | 5. Editing | Cut, move, fades, crossfades (non-destructive), undo |
@@ -47,7 +47,20 @@ The first ASIO build downloads the Steinberg ASIO SDK automatically.
   runs at the sample rate set for the device in Windows Sound settings.
 - **R** on a track arms it for recording *and* lets you hear its input.
 - Keys: **Space** play/stop · **R** record · **Enter** go to start · **K** click on/off ·
-  **Delete** remove selected clip · **Ctrl+S** save · **Ctrl+T** new track.
+  **X** mixer / tracks · **Delete** remove selected clip · **Ctrl+S** save · **Ctrl+T** new track.
+- **Mixer (X):** one strip per track, then the buses, then the master. On a strip, top to
+  bottom: input, sends, output, pan, volume, fader + meter, R/M/S, name.
+  - **Buses** (`+ Bus`, or "New Bus" in any send/output menu) are stereo aux channels.
+    Set a track's **output** to a bus to group tracks (all drums → "Drums" bus, one fader).
+    Use a **send** for effects like reverb: the track still plays normally, and a copy goes to
+    the bus at the send knob's level. Real effects arrive in Phase 3.
+  - Sends are post-fader (follow the track's fader) unless you tick **Pre-fader** in the
+    send's menu (yellow knob). Right-click a strip's name to delete it.
+  - Faders: drag (hold **Shift** for fine moves), double-click for 0 dB, or type a value in
+    the box above. The meter's red light at the top means the signal went over 0 dBFS;
+    click it to reset.
+  - Solo a bus to hear it and everything feeding it. Solo a track and its buses stay on, so
+    you still hear its reverb.
 - Stop returns to where you started playing; Stop again goes to the beginning.
 - **Ctrl+mouse wheel** zooms the timeline, **Shift+wheel** scrolls it. Click the ruler or
   an empty lane to move the playhead. Right-click a track header to delete it.
@@ -77,3 +90,4 @@ For the X32 the device name will be something like `"X-USB"`.
 - Clips are held in RAM (about 11.5 MB per mono minute at 48 kHz).
 - Only one interface at a time (two separate USB interfaces can't be combined yet).
 - No undo, no clip moving yet (Phase 5).
+- Buses feed the master only (no bus → bus routing yet); up to 32 buses per session.

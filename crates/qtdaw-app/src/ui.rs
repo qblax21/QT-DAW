@@ -10,7 +10,8 @@ use qtdaw_engine::clip::OVERVIEW_FRAMES;
 use qtdaw_engine::session;
 use qtdaw_engine::to_dbfs;
 
-use crate::app::QtDaw;
+use crate::app::{MainView, MeterState, QtDaw};
+use crate::mixer::{fader, fmt_pan};
 
 // ------------------------------------------------------------------------- look
 
@@ -53,7 +54,7 @@ pub fn apply_theme(ctx: &egui::Context) {
     ctx.set_visuals(v);
 }
 
-fn track_color(i: usize) -> Color32 {
+pub(crate) fn track_color(i: usize) -> Color32 {
     TRACK_COLORS[i % TRACK_COLORS.len()]
 }
 
@@ -71,18 +72,26 @@ fn meter_fraction(level: f32) -> (f32, Color32) {
     (f, color)
 }
 
-fn paint_meter(painter: &egui::Painter, rect: Rect, level: f32, vertical: bool) {
+/// A small meter (track headers, inputs, control bar) with a peak-hold tick.
+fn paint_meter(painter: &egui::Painter, rect: Rect, m: &MeterState, vertical: bool) {
     painter.rect_filled(rect, 1.0, LCD);
-    let (f, color) = meter_fraction(level);
-    if f <= 0.0 {
-        return;
+    let (f, color) = meter_fraction(m.level);
+    if f > 0.0 {
+        let fill = if vertical {
+            Rect::from_min_max(Pos2::new(rect.left(), rect.bottom() - rect.height() * f), rect.max)
+        } else {
+            Rect::from_min_max(rect.min, Pos2::new(rect.left() + rect.width() * f, rect.bottom()))
+        };
+        painter.rect_filled(fill, 1.0, if m.clipped { REC } else { color });
     }
-    let fill = if vertical {
-        Rect::from_min_max(Pos2::new(rect.left(), rect.bottom() - rect.height() * f), rect.max)
-    } else {
-        Rect::from_min_max(rect.min, Pos2::new(rect.left() + rect.width() * f, rect.bottom()))
-    };
-    painter.rect_filled(fill, 1.0, color);
+    let (h, hold_color) = meter_fraction(m.hold);
+    if h > 0.0 {
+        if vertical {
+            painter.hline(rect.x_range(), rect.bottom() - rect.height() * h, Stroke::new(1.0, hold_color));
+        } else {
+            painter.vline(rect.left() + rect.width() * h, rect.y_range(), Stroke::new(1.0, hold_color));
+        }
+    }
 }
 
 // ------------------------------------------------------------------------- app
@@ -103,9 +112,13 @@ impl eframe::App for QtDaw {
         egui::Panel::bottom("status")
             .frame(Frame::default().fill(PANEL).inner_margin(Margin::symmetric(10, 4)))
             .show(ui, |ui| self.status_bar(ui));
-        egui::CentralPanel::default()
-            .frame(Frame::default().fill(BG))
-            .show(ui, |ui| self.arrange(ui));
+        egui::CentralPanel::default().frame(Frame::default().fill(BG)).show(ui, |ui| match self.view.main {
+            MainView::Tracks => self.arrange(ui),
+            MainView::Mixer => {
+                self.engine_banner(ui);
+                self.mixer(ui)
+            }
+        });
 
         self.dialogs(&ctx);
     }
@@ -118,7 +131,9 @@ impl QtDaw {
         }
         let (mut space, mut rec, mut home, mut click, mut del, mut save, mut new_track) =
             (false, false, false, false, false, false, false);
+        let mut toggle_mixer = false;
         ctx.input_mut(|i| {
+            toggle_mixer = i.consume_key(Modifiers::NONE, Key::X);
             space = i.consume_key(Modifiers::NONE, Key::Space);
             rec = i.consume_key(Modifiers::NONE, Key::R);
             home = i.consume_key(Modifiers::NONE, Key::Enter) || i.consume_key(Modifiers::NONE, Key::Home);
@@ -150,6 +165,16 @@ impl QtDaw {
         if new_track {
             self.add_track();
         }
+        if toggle_mixer {
+            self.toggle_mixer();
+        }
+    }
+
+    fn toggle_mixer(&mut self) {
+        self.view.main = match self.view.main {
+            MainView::Tracks => MainView::Mixer,
+            MainView::Mixer => MainView::Tracks,
+        };
     }
 
     // --------------------------------------------------------------------- menu
@@ -176,6 +201,21 @@ impl QtDaw {
             ui.menu_button("Track", |ui| {
                 if ui.button("New Audio Track   Ctrl+T").clicked() {
                     self.add_track();
+                    ui.close();
+                }
+                if ui.button("New Bus").clicked() {
+                    self.add_bus();
+                    self.view.main = MainView::Mixer;
+                    ui.close();
+                }
+            });
+            ui.menu_button("View", |ui| {
+                if ui.radio(self.view.main == MainView::Tracks, "Tracks").clicked() {
+                    self.view.main = MainView::Tracks;
+                    ui.close();
+                }
+                if ui.radio(self.view.main == MainView::Mixer, "Mixer   X").clicked() {
+                    self.view.main = MainView::Mixer;
                     ui.close();
                 }
             });
@@ -243,23 +283,23 @@ impl QtDaw {
             });
             self.shared.count_in_bars.store(bars, Ordering::Relaxed);
 
+            ui.add_space(12.0);
+            ui.selectable_value(&mut self.view.main, MainView::Tracks, "Tracks").on_hover_text("Tracks view (X)");
+            ui.selectable_value(&mut self.view.main, MainView::Mixer, "Mixer").on_hover_text("Mixer view (X)");
+
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let (rect, _) = ui.allocate_exact_size(Vec2::new(70.0, 14.0), Sense::hover());
                 let half = rect.height() / 2.0 - 1.0;
                 let p = ui.painter();
-                paint_meter(p, Rect::from_min_size(rect.min, Vec2::new(rect.width(), half)), self.view.master_levels[0], false);
+                paint_meter(p, Rect::from_min_size(rect.min, Vec2::new(rect.width(), half)), &self.view.master_levels[0], false);
                 paint_meter(
                     p,
                     Rect::from_min_size(Pos2::new(rect.left(), rect.top() + half + 2.0), Vec2::new(rect.width(), half)),
-                    self.view.master_levels[1],
+                    &self.view.master_levels[1],
                     false,
                 );
-                if ui
-                    .add(Slider::new(&mut self.session.master_db, -60.0..=6.0).show_value(false))
-                    .on_hover_text(format!("Master {:.1} dB (double-click: 0 dB)", self.session.master_db))
-                    .double_clicked()
-                {
-                    self.session.master_db = 0.0;
+                if fader(ui, &mut self.session.master_db, Vec2::new(110.0, 18.0), false).changed() {
+                    self.dirty = true;
                 }
                 ui.label(egui::RichText::new("Master").color(TEXT_DIM));
             });
@@ -307,9 +347,9 @@ impl QtDaw {
             ui.label(egui::RichText::new("Inputs").color(TEXT_DIM));
             let n = self.view.input_levels.len();
             for i in 0..n {
-                let (rect, resp) = ui.allocate_exact_size(Vec2::new(14.0, 20.0), Sense::hover());
+                let (rect, resp) = ui.allocate_exact_size(Vec2::new(14.0, 20.0), Sense::click());
                 let meter = Rect::from_min_size(rect.min, Vec2::new(6.0, rect.height()));
-                paint_meter(ui.painter(), meter, self.view.input_levels[i], true);
+                paint_meter(ui.painter(), meter, &self.view.input_levels[i], true);
                 ui.painter().text(
                     Pos2::new(rect.left() + 8.0, rect.bottom()),
                     Align2::LEFT_BOTTOM,
@@ -317,7 +357,17 @@ impl QtDaw {
                     FontId::proportional(9.0),
                     TEXT_DIM,
                 );
-                resp.on_hover_text(format!("Input {}: {:.1} dBFS", i + 1, to_dbfs(self.view.input_levels[i])));
+                let m = &mut self.view.input_levels[i];
+                if resp.clicked() {
+                    m.clipped = false;
+                }
+                resp.on_hover_text(format!(
+                    "Input {}: {:.1} dBFS (peak {:.1}){}",
+                    i + 1,
+                    to_dbfs(m.level),
+                    to_dbfs(m.hold),
+                    if m.clipped { "\nClipped! Turn the gain down on your interface. Click to reset." } else { "" }
+                ));
             }
             ui.separator();
             if let Some(msg) = self.status_text() {
@@ -346,6 +396,12 @@ impl QtDaw {
     // --------------------------------------------------------------------- tracks + timeline
 
     fn arrange(&mut self, ui: &mut egui::Ui) {
+        self.engine_banner(ui);
+        self.tracks_view(ui);
+    }
+
+    /// Red banner when the audio device couldn't be opened.
+    fn engine_banner(&mut self, ui: &mut egui::Ui) {
         if let Some(err) = self.engine_error.clone() {
             Frame::default().fill(REC.gamma_multiply(0.25)).inner_margin(8).show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -359,7 +415,9 @@ impl QtDaw {
                 });
             });
         }
+    }
 
+    fn tracks_view(&mut self, ui: &mut egui::Ui) {
         let full = ui.available_rect_before_wrap();
         let lane_left = full.left() + HEADER_W;
         let lane_w = (full.width() - HEADER_W).max(50.0);
@@ -493,13 +551,14 @@ impl QtDaw {
     fn track_header(&mut self, ui: &mut egui::Ui, idx: usize) -> Option<u64> {
         let inputs = self.input_count();
         let color = track_color(idx);
-        let level = self.view.track_levels.get(&self.session.tracks[idx].id).copied().unwrap_or(0.0);
+        let level = self.view.track_levels.get(&self.session.tracks[idx].id).copied().unwrap_or_default();
+        let output = self.session.output_name(self.session.tracks[idx].output).to_string();
         let recording = self.shared.is_recording();
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(HEADER_W, ROW_H), Sense::click());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, HEADER);
         painter.rect_filled(Rect::from_min_size(rect.min, Vec2::new(4.0, rect.height())), 0.0, color);
-        paint_meter(&painter, Rect::from_min_max(Pos2::new(rect.right() - 7.0, rect.top() + 4.0), Pos2::new(rect.right() - 3.0, rect.bottom() - 4.0)), level, true);
+        paint_meter(&painter, Rect::from_min_max(Pos2::new(rect.right() - 7.0, rect.top() + 4.0), Pos2::new(rect.right() - 3.0, rect.bottom() - 4.0)), &level, true);
 
         let mut delete = None;
         let mut changed = false;
@@ -541,24 +600,15 @@ impl QtDaw {
                             }
                         });
                 });
-                ui.spacing_mut().slider_width = 80.0;
-                let vol = ui
-                    .add(Slider::new(&mut track.volume_db, -60.0..=6.0).show_value(false))
-                    .on_hover_text(format!("Volume {:.1} dB (double-click: 0 dB)", track.volume_db));
-                if vol.double_clicked() {
-                    track.volume_db = 0.0;
-                }
-                changed |= vol.changed();
+                changed |= fader(ui, &mut track.volume_db, Vec2::new(84.0, 18.0), false).changed();
                 let pan = ui
-                    .add(egui::DragValue::new(&mut track.pan).range(-1.0..=1.0).speed(0.01).custom_formatter(|v, _| {
-                        let p = (v * 64.0).round() as i64;
-                        match p {
-                            0 => "C".to_string(),
-                            p if p < 0 => format!("L{}", -p),
-                            p => format!("R{p}"),
-                        }
-                    }))
-                    .on_hover_text("Pan: drag to change, double-click to type");
+                    .add(
+                        egui::DragValue::new(&mut track.pan)
+                            .range(-1.0..=1.0)
+                            .speed(0.01)
+                            .custom_formatter(|v, _| fmt_pan(v as f32)),
+                    )
+                    .on_hover_text(format!("Pan (drag; double-click to type)\nOutput: {output}"));
                 changed |= pan.changed();
             });
         });
@@ -918,7 +968,7 @@ fn icon_button(ui: &mut egui::Ui, icon: Icon, active: bool, active_color: Color3
 }
 
 /// A small square toggle like Logic's M / S / R buttons.
-fn small_toggle(ui: &mut egui::Ui, value: &mut bool, text: &str, on_color: Color32, tip: &str) -> egui::Response {
+pub(crate) fn small_toggle(ui: &mut egui::Ui, value: &mut bool, text: &str, on_color: Color32, tip: &str) -> egui::Response {
     let (rect, mut resp) = ui.allocate_exact_size(Vec2::new(20.0, 18.0), Sense::click());
     if resp.clicked() && ui.is_enabled() {
         *value = !*value;
