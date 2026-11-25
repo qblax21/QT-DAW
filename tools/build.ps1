@@ -27,7 +27,7 @@ Set-Location (Split-Path $PSScriptRoot -Parent)
 
 $cargoArgs = @()
 if ($Release) { $cargoArgs += '--release' }
-if (-not $NoAsio) { $cargoArgs += @('--features', 'qtdaw-probe/asio') }
+if (-not $NoAsio) { $cargoArgs += @('--features', 'qtdaw-probe/asio,qtdaw-app/asio') }
 
 & cargo build --workspace @cargoArgs
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

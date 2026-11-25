@@ -86,7 +86,7 @@ impl Passthrough {
             &in_dev,
             in_cfg,
             in_fmt,
-            move |block| {
+            move |block, _latency| {
                 in_started.store(true, Ordering::Release);
                 in_meters.record_interleaved(block, in_ch);
                 if producer.push_slice(block) < block.len() {
@@ -103,7 +103,7 @@ impl Passthrough {
             &out_dev,
             out_cfg,
             out_fmt,
-            move |block| {
+            move |block, _latency| {
                 let mut starved = false;
                 for out_frame in block.chunks_exact_mut(out_ch) {
                     if consumer.pop_slice(&mut frame) < in_ch {

@@ -4,11 +4,13 @@
 //! "Interleaved" means samples are stored frame by frame: for 3 channels the buffer is
 //! `[ch1, ch2, ch3, ch1, ch2, ch3, ...]`.
 
+use std::time::Duration;
+
 use anyhow::{Result, bail};
 use cpal::traits::DeviceTrait;
 use cpal::{
-    BufferSize, Device, FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig,
-    SupportedStreamConfigRange,
+    BufferSize, Device, FromSample, InputCallbackInfo, OutputCallbackInfo, Sample, SampleFormat,
+    SizedSample, Stream, StreamConfig, SupportedStreamConfigRange,
 };
 
 /// Largest block we expect from a driver, in samples, so the audio thread never allocates.
@@ -28,14 +30,22 @@ pub fn pick_config(
         device.supported_output_configs()?.collect()
     };
     // Prefer more channels, then f32 (no conversion), then 32-bit, then anything.
+    let supported: Vec<u32> = crate::devices::COMMON_RATES
+        .into_iter()
+        .filter(|r| ranges.iter().any(|c| c.contains_rate(*r)))
+        .collect();
     let best = ranges
         .into_iter()
         .filter(|r| r.contains_rate(sample_rate))
         .max_by_key(|r| (r.channels(), format_rank(r.sample_format())));
     let Some(range) = best else {
+        let list: Vec<String> = supported.iter().map(|r| format!("{} kHz", *r as f32 / 1000.0)).collect();
         bail!(
-            "device does not support {sample_rate} Hz for {}",
-            if input { "input" } else { "output" }
+            "the {} device can't run at {} kHz right now (it offers: {}). Use a session at that rate, \
+             or change the device's format in Windows Sound settings (WASAPI follows that setting).",
+            if input { "input" } else { "output" },
+            sample_rate as f32 / 1000.0,
+            if list.is_empty() { "nothing".to_string() } else { list.join(", ") }
         );
     };
     let format = range.sample_format();
@@ -72,7 +82,8 @@ macro_rules! with_sample_type {
     };
 }
 
-/// Open an input stream. `on_block` gets interleaved `f32` audio on the audio thread.
+/// Open an input stream. `on_block` gets interleaved `f32` audio on the audio thread, plus
+/// the driver's input latency (time from the sound reaching the converter to this callback).
 pub fn build_input<F>(
     device: &Device,
     config: StreamConfig,
@@ -81,12 +92,13 @@ pub fn build_input<F>(
     on_error: impl FnMut(cpal::Error) + Send + 'static,
 ) -> Result<Stream>
 where
-    F: FnMut(&[f32]) + Send + 'static,
+    F: FnMut(&[f32], Duration) + Send + 'static,
 {
     with_sample_type!(format, input_typed(device, config, on_block, on_error))
 }
 
-/// Open an output stream. `render` fills an interleaved `f32` block on the audio thread.
+/// Open an output stream. `render` fills an interleaved `f32` block on the audio thread and
+/// is told the output latency (time from this callback until the block is heard).
 pub fn build_output<F>(
     device: &Device,
     config: StreamConfig,
@@ -95,7 +107,7 @@ pub fn build_output<F>(
     on_error: impl FnMut(cpal::Error) + Send + 'static,
 ) -> Result<Stream>
 where
-    F: FnMut(&mut [f32]) + Send + 'static,
+    F: FnMut(&mut [f32], Duration) + Send + 'static,
 {
     with_sample_type!(format, output_typed(device, config, render, on_error))
 }
@@ -103,7 +115,7 @@ where
 fn input_typed<T>(
     device: &Device,
     config: StreamConfig,
-    mut on_block: impl FnMut(&[f32]) + Send + 'static,
+    mut on_block: impl FnMut(&[f32], Duration) + Send + 'static,
     on_error: impl FnMut(cpal::Error) + Send + 'static,
 ) -> Result<Stream>
 where
@@ -113,10 +125,11 @@ where
     let mut scratch: Vec<f32> = Vec::with_capacity(SCRATCH_SAMPLES);
     let stream = device.build_input_stream(
         config,
-        move |data: &[T], _| {
+        move |data: &[T], info: &InputCallbackInfo| {
+            let ts = info.timestamp();
             scratch.clear();
             scratch.extend(data.iter().map(|s| f32::from_sample(*s)));
-            on_block(&scratch);
+            on_block(&scratch, ts.callback.duration_since(ts.capture));
         },
         on_error,
         None,
@@ -127,7 +140,7 @@ where
 fn output_typed<T>(
     device: &Device,
     config: StreamConfig,
-    mut render: impl FnMut(&mut [f32]) + Send + 'static,
+    mut render: impl FnMut(&mut [f32], Duration) + Send + 'static,
     on_error: impl FnMut(cpal::Error) + Send + 'static,
 ) -> Result<Stream>
 where
@@ -136,10 +149,11 @@ where
     let mut scratch: Vec<f32> = Vec::with_capacity(SCRATCH_SAMPLES);
     let stream = device.build_output_stream(
         config,
-        move |data: &mut [T], _| {
+        move |data: &mut [T], info: &OutputCallbackInfo| {
+            let ts = info.timestamp();
             scratch.clear();
             scratch.resize(data.len(), 0.0);
-            render(&mut scratch);
+            render(&mut scratch, ts.playback.duration_since(ts.callback));
             for (out, s) in data.iter_mut().zip(&scratch) {
                 *out = s.clamp(-1.0, 1.0).to_sample::<T>();
             }
