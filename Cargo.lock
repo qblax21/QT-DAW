@@ -2985,6 +2985,7 @@ name = "qtdaw-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "dirs",
  "eframe",
  "qtdaw-engine",

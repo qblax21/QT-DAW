@@ -23,6 +23,7 @@ use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
 
 use crate::devices::{self, device_name};
+use crate::fx::{self, InsertRt};
 use crate::io;
 use crate::meter::Meters;
 use crate::recorder::Recorder;
@@ -77,6 +78,8 @@ pub struct TrackRt {
     /// [`MASTER`] or the id of the bus this track plays into.
     pub output: AtomicU64,
     pub sends: ArcSwap<Vec<SendRt>>,
+    /// Effects, run on the track's signal before the fader.
+    pub inserts: ArcSwap<Vec<Arc<InsertRt>>>,
     pub clips: ArcSwap<Vec<ClipRt>>,
     peak: AtomicU32,
 }
@@ -93,6 +96,7 @@ impl TrackRt {
             solo: AtomicBool::new(false),
             output: AtomicU64::new(MASTER),
             sends: ArcSwap::from_pointee(Vec::new()),
+            inserts: ArcSwap::from_pointee(Vec::new()),
             clips: ArcSwap::from_pointee(Vec::new()),
             peak: AtomicU32::new(0),
         }
@@ -112,6 +116,8 @@ pub struct BusRt {
     pub pan: AtomicF32,
     pub mute: AtomicBool,
     pub solo: AtomicBool,
+    /// Effects, run before the bus fader.
+    pub inserts: ArcSwap<Vec<Arc<InsertRt>>>,
     peak: [AtomicU32; 2],
 }
 
@@ -123,6 +129,7 @@ impl BusRt {
             pan: AtomicF32::new(0.0),
             mute: AtomicBool::new(false),
             solo: AtomicBool::new(false),
+            inserts: ArcSwap::from_pointee(Vec::new()),
             peak: [AtomicU32::new(0), AtomicU32::new(0)],
         }
     }
@@ -168,6 +175,8 @@ pub struct Shared {
     pub click_gain: AtomicF32,
     pub count_in_bars: AtomicU32,
     pub master_gain: AtomicF32,
+    /// Effects after the master fader.
+    pub master_inserts: ArcSwap<Vec<Arc<InsertRt>>>,
     /// Frames to shift recordings by on top of the measured latency (+ = earlier).
     pub record_adjust: AtomicI64,
 
@@ -198,6 +207,7 @@ impl Default for Shared {
             click_gain: AtomicF32::new(0.5),
             count_in_bars: AtomicU32::new(1),
             master_gain: AtomicF32::new(1.0),
+            master_inserts: ArcSwap::from_pointee(Vec::new()),
             record_adjust: AtomicI64::new(0),
             playhead: AtomicI64::new(0),
             playing: AtomicBool::new(false),
@@ -444,6 +454,7 @@ impl Rt {
     }
 
     fn process(&mut self, out: &mut [f32], out_latency: Duration) {
+        flush_denormals();
         let n = out.len() / self.out_ch;
         self.out_latency = duration_frames(out_latency, self.sr as usize);
         if self.mix_l.len() < n {
@@ -488,12 +499,18 @@ impl Rt {
         }
         self.shared.playhead.store(self.playhead, Ordering::Release);
 
-        // 4. Master fader, meters, and out to the first two outputs.
+        // 4. Master fader, master effects, meters, and out to the first two outputs.
         let master = self.shared.master_gain.get();
+        for (l, r) in self.mix_l[..n].iter_mut().zip(&mut self.mix_r[..n]) {
+            *l *= master;
+            *r *= master;
+        }
+        let ctx = self.fx_ctx();
+        fx::run_chain(&self.shared.master_inserts.load(), &ctx, &mut [&mut self.mix_l[..n], &mut self.mix_r[..n]]);
         let (mut pk_l, mut pk_r) = (0.0f32, 0.0f32);
         for (i, frame) in out.chunks_exact_mut(self.out_ch).enumerate() {
-            let l = self.mix_l[i] * master;
-            let r = self.mix_r[i] * master;
+            let l = self.mix_l[i];
+            let r = self.mix_r[i];
             pk_l = pk_l.max(l.abs());
             pk_r = pk_r.max(r.abs());
             frame.fill(0.0);
@@ -588,6 +605,10 @@ impl Rt {
         self.shared.counting_in.store(mode == Mode::CountIn, Ordering::Release);
     }
 
+    fn fx_ctx(&self) -> fx::Ctx {
+        fx::Ctx { sr: self.sr as f32, tempo: self.shared.tempo.get() }
+    }
+
     fn beat_len(&self) -> f64 {
         self.sr * 60.0 / self.shared.tempo.get().clamp(20.0, 400.0) as f64
     }
@@ -608,6 +629,7 @@ impl Rt {
         }
         let bus_index = |id: u64| buses.iter().position(|b| b.id == id);
         let bus_soloed = |i: Option<usize>| i.is_some_and(|i| buses[i].solo.load(Ordering::Relaxed));
+        let ctx = self.fx_ctx();
 
         // Solo: with anything soloed, you hear soloed tracks, soloed buses (and the tracks
         // feeding them), and the buses a soloed track feeds (so its reverb stays on).
@@ -637,6 +659,7 @@ impl Rt {
             } else if advancing {
                 render_clips(&t.clips.load(), self.playhead, tb);
             }
+            fx::run_chain(&t.inserts.load(), &ctx, &mut [&mut *tb]);
 
             let muted = t.mute.load(Ordering::Relaxed);
             let soloed = t.solo.load(Ordering::Relaxed);
@@ -665,8 +688,9 @@ impl Rt {
             }
         }
 
-        // Buses into the master.
+        // Buses (through their effects) into the master.
         for (i, b) in buses.iter().enumerate() {
+            fx::run_chain(&b.inserts.load(), &ctx, &mut [&mut self.bus_l[i][seg.clone()], &mut self.bus_r[i][seg.clone()]]);
             let audible = !b.mute.load(Ordering::Relaxed)
                 && (!any_solo || b.solo.load(Ordering::Relaxed) || fed_by_solo[i]);
             let gain = if audible { b.gain.get() } else { 0.0 };
@@ -727,6 +751,20 @@ impl Rt {
                 self.mix_r[off + i] += s;
             }
         }
+    }
+}
+
+/// Treat tiny "denormal" numbers as zero. Reverb and filter tails decay into them, and on
+/// x86 CPUs they are up to 100x slower to compute, which can cause dropouts.
+#[inline]
+fn flush_denormals() {
+    #[cfg(target_arch = "x86_64")]
+    #[allow(deprecated)]
+    // SAFETY: only sets the flush-to-zero / denormals-are-zero bits of this thread's
+    // floating-point control register.
+    unsafe {
+        use std::arch::x86_64::{_mm_getcsr, _mm_setcsr};
+        _mm_setcsr(_mm_getcsr() | 0x8040);
     }
 }
 
@@ -874,6 +912,35 @@ mod tests {
         shared.buses.load()[0].mute.store(true, Ordering::Relaxed);
         let (l, _) = first_frame(&mut rt);
         assert!(close(l, 0.0), "{l}");
+    }
+
+    #[test]
+    fn effects_run_on_tracks_buses_and_master() {
+        use crate::fx::EffectKind;
+        let shared = Arc::new(Shared::default());
+        // A limiter with a -6 dB ceiling on the master caps everything.
+        let lim = Arc::new(InsertRt::new(100, EffectKind::Limiter));
+        let mut p = EffectKind::Limiter.defaults();
+        p[1] = -6.0;
+        lim.set_params(&p);
+        shared.master_inserts.store(Arc::new(vec![lim.clone()]));
+        // A compressor on the track.
+        let comp = Arc::new(InsertRt::new(101, EffectKind::Compressor));
+        let t = dc_track(1, MASTER);
+        t.inserts.store(Arc::new(vec![comp.clone()]));
+        shared.tracks.store(Arc::new(vec![t]));
+        let mut rt = test_rt(&shared);
+        let mut out = vec![0.0; 2 * 800];
+        rt.process(&mut out, Duration::ZERO);
+        let ceiling = 10f32.powf(-6.0 / 20.0);
+        assert!(out.iter().all(|s| s.abs() <= ceiling + 1e-6));
+        assert!(comp.take_reduction() > 1.0);
+
+        // Bypassed effects do nothing.
+        lim.bypass.store(true, Ordering::Relaxed);
+        comp.bypass.store(true, Ordering::Relaxed);
+        let (l, _) = first_frame(&mut rt);
+        assert!(close(l, CENTER), "{l}");
     }
 
     #[test]

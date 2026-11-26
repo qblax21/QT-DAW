@@ -11,7 +11,7 @@ and mixing/mastering, with a Claude MCP server so Claude can do first-pass mixes
 | **0. Hardware probe** (done) | Project setup; QT DAW sees your interface over ASIO and meters every input live |
 | **1. Recorder** (done) | App window; record any number of armed tracks to disk, playback, click + count-in, tempo, input monitoring, volume/pan/mute/solo, save/open sessions |
 | **2. Mixer** (done) | Mixer view (X), aux buses, pre/post-fader sends, track output routing, console-style faders, meters with peak hold and clip lights |
-| 3. Built-in effects | EQ, compressor, gate, de-esser, reverb, delay, limiter, vocal chain presets |
+| **3. Built-in effects** (done) | Channel EQ, compressor, noise gate, de-esser, limiter, delay, reverb on tracks, buses and the master; chain presets (vocal, drums, reverb bus, master...) |
 | 4. Claude MCP | Analysis (loudness, spectrum, masking) + mix controls for Claude |
 | 5. Editing | Cut, move, fades, crossfades (non-destructive), undo |
 | 6. X32 control surface | X32 faders/mutes drive QT DAW via its DAW Remote (Mackie/HUI) mode |
@@ -61,6 +61,19 @@ The first ASIO build downloads the Steinberg ASIO SDK automatically.
     click it to reset.
   - Solo a bus to hear it and everything feeding it. Solo a track and its buses stay on, so
     you still hear its reverb.
+- **Audio FX (effects):** the slots near the top of each mixer strip. Click **Audio FX…** to add
+  an effect, or pick **Chain Presets** for a ready-made chain (Lead Vocal, Kick, Reverb Bus,
+  Master...). Up to 8 effects per channel; they run top to bottom.
+  - Click an effect's slot to open its window; the dot on the left turns it on/off (bypass)
+    so you can compare. Right-click a slot to move it up/down or remove it.
+  - Knobs: drag up/down (Shift = fine), double-click for the default. On the EQ you can also
+    drag the colored dots on the curve, and scroll over a Mid dot to make it wider/narrower.
+  - Compressor, gate, de-esser and limiter show **Reduction**: how many dB they are turning
+    the sound down right now.
+  - Reverb and delay sound best on a bus (Mix 100%) that tracks send to, so several tracks
+    share one room. The Reverb Bus / Delay Bus presets set that up.
+  - Track effects come before the fader; master effects come after the master fader, so a
+    limiter's ceiling always holds.
 - Stop returns to where you started playing; Stop again goes to the beginning.
 - **Ctrl+mouse wheel** zooms the timeline, **Shift+wheel** scrolls it. Click the ruler or
   an empty lane to move the playhead. Right-click a track header to delete it.
@@ -91,3 +104,5 @@ For the X32 the device name will be something like `"X-USB"`.
 - Only one interface at a time (two separate USB interfaces can't be combined yet).
 - No undo, no clip moving yet (Phase 5).
 - Buses feed the master only (no bus → bus routing yet); up to 32 buses per session.
+- Tracks are mono, so effects on a track are mono too (reverb/delay are stereo on a bus).
+- No delay compensation yet: the limiter delays its channel by 1.5 ms (harmless on the master).

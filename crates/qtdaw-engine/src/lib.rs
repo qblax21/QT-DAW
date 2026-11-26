@@ -1,5 +1,7 @@
 //! QT DAW audio engine.
 //!
+//! Phase 3 adds [`fx`] (built-in effects and chain presets).
+//!
 //! Phase 1 adds [`engine`] (transport, click, monitoring, playback), [`recorder`] (disk
 //! writer), [`session`] (save/load) and [`clip`] (audio in memory + waveform overviews).
 //!
@@ -16,6 +18,7 @@
 pub mod clip;
 pub mod devices;
 pub mod engine;
+pub mod fx;
 pub mod io;
 pub mod meter;
 pub mod passthrough;

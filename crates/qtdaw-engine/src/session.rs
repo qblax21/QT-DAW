@@ -8,11 +8,14 @@
 //!   audio/            <- one WAV file per recorded take
 //! ```
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+
+use crate::fx::{EffectKind, MAX_PARAMS, Params};
 
 pub const SESSION_FILE: &str = "session.qtdaw";
 pub const AUDIO_DIR: &str = "audio";
@@ -33,6 +36,8 @@ pub struct Session {
     /// Aux buses: tracks can be routed into them (e.g. a drum bus) or send a copy to them
     /// (e.g. a reverb bus). Buses always feed the master.
     pub buses: Vec<BusModel>,
+    /// Effects on the master, after the master fader (so a limiter's ceiling always holds).
+    pub master_inserts: Vec<InsertModel>,
 }
 
 impl Default for Session {
@@ -47,6 +52,7 @@ impl Default for Session {
             next_id: 1,
             tracks: Vec::new(),
             buses: Vec::new(),
+            master_inserts: Vec::new(),
         }
     }
 }
@@ -67,11 +73,56 @@ pub struct BusModel {
     pub pan: f32,
     pub mute: bool,
     pub solo: bool,
+    /// Effects, before the bus fader.
+    pub inserts: Vec<InsertModel>,
 }
 
 impl Default for BusModel {
     fn default() -> Self {
-        Self { id: 0, name: String::new(), volume_db: 0.0, pan: 0.0, mute: false, solo: false }
+        Self { id: 0, name: String::new(), volume_db: 0.0, pan: 0.0, mute: false, solo: false, inserts: Vec::new() }
+    }
+}
+
+/// The most effects one track, bus or the master can hold.
+pub const MAX_INSERTS: usize = 8;
+
+/// One effect in a chain ("insert").
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InsertModel {
+    /// Unique within the session (same counter as tracks and buses).
+    pub id: u64,
+    pub kind: EffectKind,
+    #[serde(default)]
+    pub bypass: bool,
+    /// Settings by name. Missing ones use the default, so sessions keep loading when a
+    /// later version adds a setting.
+    #[serde(default)]
+    pub params: BTreeMap<String, f32>,
+}
+
+impl InsertModel {
+    pub fn new(id: u64, kind: EffectKind, values: &Params) -> Self {
+        let params = kind.params().iter().zip(values).map(|(s, v)| (s.key.to_string(), s.clamp(*v))).collect();
+        Self { id, kind, bypass: false, params }
+    }
+
+    /// All settings, indexed like kind.params().
+    pub fn values(&self) -> Params {
+        let mut p = [0.0; MAX_PARAMS];
+        for (v, s) in p.iter_mut().zip(self.kind.params()) {
+            *v = s.clamp(self.params.get(s.key).copied().unwrap_or(s.default));
+        }
+        p
+    }
+
+    pub fn get(&self, index: usize) -> f32 {
+        self.values()[index]
+    }
+
+    pub fn set(&mut self, index: usize, v: f32) {
+        if let Some(s) = self.kind.params().get(index) {
+            self.params.insert(s.key.to_string(), s.clamp(v));
+        }
     }
 }
 
@@ -100,6 +151,8 @@ pub struct TrackModel {
     /// Where the track plays to: [`MASTER`] or a bus id.
     pub output: u64,
     pub sends: Vec<SendModel>,
+    /// Effects, before the fader (so pre-fader sends hear them too).
+    pub inserts: Vec<InsertModel>,
     /// Record-arm is not saved: reopening a session should never start recording a track
     /// you forgot about.
     #[serde(skip)]
@@ -122,6 +175,7 @@ impl Default for TrackModel {
             solo: false,
             output: MASTER,
             sends: Vec::new(),
+            inserts: Vec::new(),
             armed: false,
             clips: Vec::new(),
             takes: 0,
@@ -177,6 +231,23 @@ impl Session {
             }
             t.sends.retain(|s| s.bus != id);
         }
+    }
+
+    /// A new effect with the next free id.
+    pub fn new_insert(&mut self, kind: EffectKind, values: &Params) -> InsertModel {
+        let id = self.next_id;
+        self.next_id += 1;
+        InsertModel::new(id, kind, values)
+    }
+
+    /// The effect with this id, wherever it is.
+    pub fn insert_mut(&mut self, id: u64) -> Option<&mut InsertModel> {
+        self.tracks
+            .iter_mut()
+            .flat_map(|t| t.inserts.iter_mut())
+            .chain(self.buses.iter_mut().flat_map(|b| b.inserts.iter_mut()))
+            .chain(self.master_inserts.iter_mut())
+            .find(|i| i.id == id)
     }
 
     /// Display name for an output id ("Master" or the bus name).
@@ -290,6 +361,28 @@ mod tests {
         let s: Session = serde_json::from_str(json).unwrap();
         assert_eq!(s.tracks[0].output, MASTER);
         assert!(s.buses.is_empty());
+    }
+
+    #[test]
+    fn inserts_save_by_name_and_fill_in_defaults() {
+        let mut s = Session::new("Test", 48_000);
+        let t = s.add_track(None, 0);
+        let mut eq = s.new_insert(EffectKind::Eq, &EffectKind::Eq.defaults());
+        eq.set(crate::fx::eq::LOW_CUT, 90.0);
+        let eq_id = eq.id;
+        s.track_mut(t).unwrap().inserts.push(eq);
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"low_cut\":90.0"), "{json}");
+        assert!(json.contains("\"kind\":\"eq\""));
+        let back: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.tracks[0].inserts[0].get(crate::fx::eq::LOW_CUT), 90.0);
+        assert!(s.insert_mut(eq_id).is_some());
+
+        // A setting missing from the file comes back as its default.
+        let json = r#"{"id":5,"kind":"compressor","params":{"ratio":8.0}}"#;
+        let ins: InsertModel = serde_json::from_str(json).unwrap();
+        assert_eq!(ins.values()[1], 8.0);
+        assert_eq!(ins.values()[0], -18.0);
     }
 
     #[test]

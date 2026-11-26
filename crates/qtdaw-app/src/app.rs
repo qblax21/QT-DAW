@@ -1,19 +1,23 @@
 //! App state and the actions that change it. Drawing lives in `ui.rs`.
 
-use std::collections::HashMap;
+use std::any::Any;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwap;
 use eframe::egui;
 use qtdaw_engine::clip::ClipAudio;
 use qtdaw_engine::devices::{self, DeviceInfo};
 use qtdaw_engine::engine::{
     AtomicF32, BusRt, ClipRt, Engine, EngineConfig, Request, SendRt, Shared, TrackRt, db_to_gain,
 };
+use qtdaw_engine::fx::{EffectKind, InsertRt};
+use qtdaw_engine::fx::presets::ChainPreset;
 use qtdaw_engine::recorder::{RecorderEvent, TakeSpec};
-use qtdaw_engine::session::{self, ClipModel, Session};
+use qtdaw_engine::session::{self, ClipModel, InsertModel, MAX_INSERTS, Session};
 
 use crate::settings::Settings;
 
@@ -52,6 +56,14 @@ pub enum MainView {
     Mixer,
 }
 
+/// Which effect chain: a track's, a bus's or the master's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Chain {
+    Track(u64),
+    Bus(u64),
+    Master,
+}
+
 /// UI-only state (zoom, scroll, open dialogs...).
 pub struct View {
     pub main: MainView,
@@ -70,6 +82,10 @@ pub struct View {
     pub track_levels: HashMap<u64, MeterState>,
     pub bus_levels: HashMap<u64, [MeterState; 2]>,
     pub master_levels: [MeterState; 2],
+    /// Effect editor windows that are open (insert ids).
+    pub open_fx: Vec<u64>,
+    /// Gain reduction per insert, for the dynamics meters.
+    pub fx_reduction: HashMap<u64, f32>,
     pub devices: Vec<DeviceInfo>,
     pub sessions: Vec<PathBuf>,
     /// Settings being edited in the Audio Settings window.
@@ -89,6 +105,12 @@ pub struct QtDaw {
     pub rts: Vec<Arc<TrackRt>>,
     /// Engine-side mirror of each bus, same order as `session.buses`.
     pub bus_rts: Vec<Arc<BusRt>>,
+    /// Engine-side effects by insert id (they keep their memory, like reverb tails).
+    pub fx_rts: HashMap<u64, Arc<InsertRt>>,
+    /// Things the audio thread might still be using a moment after we let go of them.
+    /// Holding them here a little longer means the audio thread never has to free memory
+    /// (which can be slow enough to cause a click).
+    graveyard: Vec<(Instant, Arc<dyn Any + Send + Sync>)>,
     /// Loaded audio, keyed by the clip's file path relative to the session folder.
     pub audio: HashMap<String, Arc<ClipAudio>>,
     pub view: View,
@@ -108,6 +130,8 @@ impl QtDaw {
             dirty: false,
             rts: Vec::new(),
             bus_rts: Vec::new(),
+            fx_rts: HashMap::new(),
+            graveyard: Vec::new(),
             audio: HashMap::new(),
             view: View {
                 main: MainView::Tracks,
@@ -123,6 +147,8 @@ impl QtDaw {
                 track_levels: HashMap::new(),
                 bus_levels: HashMap::new(),
                 master_levels: [MeterState::default(); 2],
+                open_fx: Vec::new(),
+                fx_reduction: HashMap::new(),
                 devices: Vec::new(),
                 sessions: Vec::new(),
                 draft: settings.clone(),
@@ -234,6 +260,80 @@ impl QtDaw {
         }
     }
 
+    /// Mirror every effect chain into the engine: create engine effects for new inserts,
+    /// swap a chain's list only when its order changed, and copy settings every frame.
+    pub fn sync_inserts(&mut self) {
+        let now = Instant::now();
+        let mut used = HashSet::new();
+        let mut dead: Vec<Arc<dyn Any + Send + Sync>> = Vec::new();
+        let pool = &mut self.fx_rts;
+        for (t, rt) in self.session.tracks.iter().zip(&self.rts) {
+            sync_chain(&t.inserts, &rt.inserts, pool, &mut used, &mut dead);
+        }
+        for (b, rt) in self.session.buses.iter().zip(&self.bus_rts) {
+            sync_chain(&b.inserts, &rt.inserts, pool, &mut used, &mut dead);
+        }
+        sync_chain(&self.session.master_inserts, &self.shared.master_inserts, pool, &mut used, &mut dead);
+        let removed: Vec<u64> = pool.keys().filter(|id| !used.contains(*id)).copied().collect();
+        for id in removed {
+            if let Some(rt) = pool.remove(&id) {
+                dead.push(rt);
+            }
+            self.view.fx_reduction.remove(&id);
+        }
+        self.graveyard.extend(dead.into_iter().map(|d| (now, d)));
+        self.graveyard.retain(|(t, _)| t.elapsed() < Duration::from_secs(2));
+    }
+
+    pub fn chain_mut(&mut self, chain: Chain) -> Option<&mut Vec<InsertModel>> {
+        match chain {
+            Chain::Track(id) => self.session.track_mut(id).map(|t| &mut t.inserts),
+            Chain::Bus(id) => self.session.buses.iter_mut().find(|b| b.id == id).map(|b| &mut b.inserts),
+            Chain::Master => Some(&mut self.session.master_inserts),
+        }
+    }
+
+    /// Add an effect to the end of a chain and open its window.
+    pub fn add_insert(&mut self, chain: Chain, kind: EffectKind) {
+        let ins = self.session.new_insert(kind, &kind.defaults());
+        let id = ins.id;
+        let Some(list) = self.chain_mut(chain) else { return };
+        if list.len() >= MAX_INSERTS {
+            self.say(format!("A channel can have up to {MAX_INSERTS} effects."));
+            return;
+        }
+        list.push(ins);
+        self.view.open_fx.push(id);
+        self.dirty = true;
+        self.sync_inserts();
+    }
+
+    /// Add a preset's effects to the end of a chain.
+    pub fn add_preset(&mut self, chain: Chain, preset: &ChainPreset) {
+        let new: Vec<InsertModel> = preset.build().iter().map(|(k, p)| self.session.new_insert(*k, p)).collect();
+        let Some(list) = self.chain_mut(chain) else { return };
+        let room = MAX_INSERTS.saturating_sub(list.len());
+        let skipped = new.len().saturating_sub(room);
+        list.extend(new.into_iter().take(room));
+        self.dirty = true;
+        self.sync_inserts();
+        if skipped > 0 {
+            self.say(format!("Added {} only partly: a channel can have up to {MAX_INSERTS} effects.", preset.name));
+        } else {
+            self.say(format!("Added the {} preset.", preset.name));
+        }
+    }
+
+    /// Let go of every engine effect (when switching sessions, whose ids can repeat).
+    fn clear_fx(&mut self) {
+        let now = Instant::now();
+        for (_, rt) in self.fx_rts.drain() {
+            self.graveyard.push((now, rt));
+        }
+        self.view.open_fx.clear();
+        self.view.fx_reduction.clear();
+    }
+
     /// Rebuild the engine's bus list after buses were added or removed.
     pub fn rebuild_buses(&mut self) {
         let mut old: HashMap<u64, Arc<BusRt>> = self.bus_rts.drain(..).map(|r| (r.id, r)).collect();
@@ -245,6 +345,7 @@ impl QtDaw {
             .collect();
         self.shared.buses.store(Arc::new(self.bus_rts.clone()));
         self.sync_engine();
+        self.sync_inserts();
     }
 
     /// Rebuild the engine's track list after tracks were added, removed or reordered.
@@ -262,6 +363,7 @@ impl QtDaw {
             self.refresh_clips(id);
         }
         self.sync_engine();
+        self.sync_inserts();
     }
 
     /// Hand a track's current clips to the engine.
@@ -462,6 +564,7 @@ impl QtDaw {
         let name = session::safe_file_name(if name.trim().is_empty() { "Untitled" } else { name });
         let mut s = Session::new(&name, sample_rate);
         s.add_track(Some("Audio 1".into()), 0);
+        self.clear_fx();
         self.session = s;
         self.folder = None;
         self.audio.clear();
@@ -495,6 +598,7 @@ impl QtDaw {
                 Err(_) => missing += 1,
             }
         }
+        self.clear_fx();
         self.session = session;
         self.folder = Some(folder.to_path_buf());
         self.dirty = false;
@@ -521,6 +625,7 @@ impl QtDaw {
     pub fn tick(&mut self, ctx: &egui::Context) {
         self.poll_recorder();
         self.sync_engine();
+        self.sync_inserts();
 
         let now = ctx.input(|i| i.time);
         if let Some(engine) = &self.engine {
@@ -540,6 +645,10 @@ impl QtDaw {
                 m[i].update(peaks[i], now);
             }
         }
+        for (id, rt) in &self.fx_rts {
+            let r = self.view.fx_reduction.entry(*id).or_default();
+            *r = rt.take_reduction().max(*r * 0.85);
+        }
         let peaks = self.shared.take_master_peaks();
         for i in 0..2 {
             self.view.master_levels[i].update(peaks[i], now);
@@ -551,6 +660,33 @@ impl QtDaw {
 
     pub fn sample_rate(&self) -> f64 {
         self.session.sample_rate as f64
+    }
+}
+
+/// See [QtDaw::sync_inserts].
+fn sync_chain(
+    models: &[InsertModel],
+    slot: &ArcSwap<Vec<Arc<InsertRt>>>,
+    pool: &mut HashMap<u64, Arc<InsertRt>>,
+    used: &mut HashSet<u64>,
+    dead: &mut Vec<Arc<dyn Any + Send + Sync>>,
+) {
+    for m in models {
+        if pool.get(&m.id).is_some_and(|rt| rt.kind != m.kind) {
+            if let Some(old) = pool.remove(&m.id) {
+                dead.push(old);
+            }
+        }
+        let rt = pool.entry(m.id).or_insert_with(|| Arc::new(InsertRt::new(m.id, m.kind)));
+        rt.set_params(&m.values());
+        rt.bypass.store(m.bypass, Ordering::Relaxed);
+        used.insert(m.id);
+    }
+    let current = slot.load();
+    let same = current.len() == models.len() && current.iter().zip(models).all(|(a, m)| Arc::ptr_eq(a, &pool[&m.id]));
+    if !same {
+        let list: Vec<Arc<InsertRt>> = models.iter().map(|m| pool[&m.id].clone()).collect();
+        dead.push(slot.swap(Arc::new(list)));
     }
 }
 

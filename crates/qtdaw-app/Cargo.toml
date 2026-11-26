@@ -13,6 +13,7 @@ path = "src/main.rs"
 asio = ["qtdaw-engine/asio"]
 
 [dependencies]
+arc-swap = "1.9.5"
 anyhow = "1.0.105"
 dirs = "7.0.0"
 eframe = "0.37.0"

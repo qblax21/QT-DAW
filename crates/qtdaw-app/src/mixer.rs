@@ -1,7 +1,7 @@
 //! The mixer view (press X): a channel strip per track, then the buses, then the master.
 //! Also the fader and knob widgets used here and in the track headers.
 //!
-//! A strip, top to bottom: input, sends, output, pan, volume readout, fader + meter,
+//! A strip, top to bottom: input, audio FX (inserts), sends, output, pan, volume readout, fader + meter,
 //! mute / solo (/ record), name. Every strip uses the same row heights, so the faders
 //! line up across the whole mixer.
 
@@ -10,10 +10,12 @@ use eframe::egui::{
     TextEdit, UiBuilder, Vec2,
 };
 use qtdaw_engine::engine::db_to_gain;
-use qtdaw_engine::session::{MASTER, SendModel};
+use qtdaw_engine::fx::EffectKind;
+use qtdaw_engine::fx::presets::{CHAIN_PRESETS, PresetFor};
+use qtdaw_engine::session::{InsertModel, MASTER, MAX_INSERTS, SendModel};
 use qtdaw_engine::to_dbfs;
 
-use crate::app::{MeterState, QtDaw};
+use crate::app::{Chain, MeterState, QtDaw};
 use crate::ui::{ACCENT, BG, HEADER, LCD, MUTE, PLAY, REC, SOLO, TEXT_DIM, small_toggle, track_color};
 
 // ------------------------------------------------------------------------- dB <-> fader position
@@ -210,6 +212,7 @@ const ROW: f32 = 20.0;
 
 struct StripRects {
     input: Rect,
+    fx: Vec<Rect>,
     sends: Vec<Rect>,
     output: Rect,
     pan: Rect,
@@ -222,7 +225,14 @@ struct StripRects {
     name: Rect,
 }
 
-fn strip_rects(rect: Rect, send_slots: usize) -> StripRects {
+/// Rows above the fader area that every strip shares.
+#[derive(Clone, Copy)]
+struct Slots {
+    fx: usize,
+    sends: usize,
+}
+
+fn strip_rects(rect: Rect, slots: Slots) -> StripRects {
     let x = (rect.left() + 4.0)..=(rect.right() - 4.0);
     let mut y = rect.top() + 4.0;
     let mut row = |h: f32| {
@@ -231,7 +241,9 @@ fn strip_rects(rect: Rect, send_slots: usize) -> StripRects {
         r
     };
     let input = row(ROW);
-    let sends = (0..send_slots).map(|_| row(ROW)).collect();
+    let fx = (0..slots.fx).map(|_| row(ROW)).collect();
+    row(1.0); // small gap between effects and sends
+    let sends = (0..slots.sends).map(|_| row(ROW)).collect();
     let output = row(ROW);
     let pan = row(32.0);
     let readout = row(18.0);
@@ -247,7 +259,7 @@ fn strip_rects(rect: Rect, send_slots: usize) -> StripRects {
     let scale = Rect::from_x_y_ranges(l + 30.0..=l + 56.0, fader_y.clone());
     let meters = Rect::from_x_y_ranges(l + 57.0..=r, fader_y);
     let clip = Rect::from_x_y_ranges(meters.x_range(), top..=top + 6.0);
-    StripRects { input, sends, output, pan, readout, clip, fader, scale, meters, buttons, name }
+    StripRects { input, fx, sends, output, pan, readout, clip, fader, scale, meters, buttons, name }
 }
 
 /// Paint one or two meters side by side; returns true if the clip light was clicked.
@@ -279,7 +291,154 @@ enum Action {
     NewBusAsSend(u64),
     DeleteTrack(u64),
     DeleteBus(u64),
+    AddInsert(Chain, EffectKind),
+    AddPreset(Chain, usize),
 }
+
+// ------------------------------------------------------------------------- insert slots
+
+/// The "Audio FX" rows of a strip: one slot per effect (click = open its window,
+/// the dot = on/off, right-click = more), then an empty slot to add one.
+fn insert_slots(
+    ui: &mut egui::Ui,
+    slots: &[Rect],
+    chain: &mut Vec<InsertModel>,
+    target: Chain,
+    open_fx: &mut Vec<u64>,
+    actions: &mut Vec<Action>,
+) -> bool {
+    enum Op {
+        Remove,
+        Up,
+        Down,
+    }
+    let mut changed = false;
+    let mut op = None;
+    let len = chain.len();
+    for (i, slot) in slots.iter().enumerate() {
+        if let Some(ins) = chain.get_mut(i) {
+            let uid = ui.scope_id().with(("fx-slot", ins.id));
+            let dot = Rect::from_center_size(Pos2::new(slot.left() + 7.0, slot.center().y), Vec2::splat(14.0));
+            let body = Rect::from_x_y_ranges((dot.right() + 2.0)..=slot.right(), slot.y_range());
+            let d = ui.interact(dot, uid.with("dot"), Sense::click()).on_hover_text("On / off (bypass)");
+            let b = ui.interact(body, uid.with("body"), Sense::click());
+            let is_open = open_fx.contains(&ins.id);
+            let p = ui.painter();
+            let on = !ins.bypass;
+            if on {
+                p.circle_filled(dot.center(), 4.0, PLAY);
+            } else {
+                p.circle_stroke(dot.center(), 4.0, Stroke::new(1.0, TEXT_DIM));
+            }
+            let fill = match (on, b.hovered()) {
+                (true, false) => Color32::from_rgb(0x2f, 0x4f, 0x7a),
+                (true, true) => Color32::from_rgb(0x3a, 0x60, 0x92),
+                (false, false) => Color32::from_gray(0x3a),
+                (false, true) => Color32::from_gray(0x46),
+            };
+            p.rect_filled(body.shrink2(Vec2::new(0.0, 1.0)), 3.0, fill);
+            if is_open {
+                p.rect_stroke(body.shrink2(Vec2::new(0.0, 1.0)), 3.0, Stroke::new(1.0, ACCENT), egui::StrokeKind::Inside);
+            }
+            let text_color = if on { Color32::WHITE } else { TEXT_DIM };
+            p.text(body.center(), Align2::CENTER_CENTER, ins.kind.short(), FontId::proportional(11.5), text_color);
+            if d.clicked() {
+                ins.bypass = !ins.bypass;
+                changed = true;
+            }
+            if b.clicked() {
+                if is_open {
+                    open_fx.retain(|x| *x != ins.id);
+                } else {
+                    open_fx.push(ins.id);
+                }
+            }
+            let b = b.on_hover_text(format!(
+                "{}{}\nClick to open, right-click for more",
+                ins.kind.name(),
+                if on { "" } else { " (bypassed)" }
+            ));
+            b.context_menu(|ui| {
+                if ui.button(if is_open { "Close Window" } else { "Open Window" }).clicked() {
+                    if is_open {
+                        open_fx.retain(|x| *x != ins.id);
+                    } else {
+                        open_fx.push(ins.id);
+                    }
+                    ui.close();
+                }
+                if ui.checkbox(&mut ins.bypass, "Bypass").changed() {
+                    changed = true;
+                }
+                ui.separator();
+                if ui.add_enabled(i > 0, egui::Button::new("Move Up")).clicked() {
+                    op = Some((i, Op::Up));
+                    ui.close();
+                }
+                if ui.add_enabled(i + 1 < len, egui::Button::new("Move Down")).clicked() {
+                    op = Some((i, Op::Down));
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Remove").clicked() {
+                    op = Some((i, Op::Remove));
+                    ui.close();
+                }
+            });
+        } else if i == chain.len() && chain.len() < MAX_INSERTS {
+            let btn = place(ui, *slot, |ui| {
+                ui.add_sized([slot.width(), ROW - 2.0], egui::Button::new(egui::RichText::new("Audio FX…").small().color(TEXT_DIM)))
+            })
+            .on_hover_text("Add an effect or a ready-made chain");
+            egui::Popup::menu(&btn).show(|ui| {
+                for kind in EffectKind::ALL {
+                    if ui.button(kind.name()).on_hover_text(kind.description()).clicked() {
+                        actions.push(Action::AddInsert(target, kind));
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                ui.menu_button("Chain Presets", |ui| {
+                    let here = match target {
+                        Chain::Track(_) => PresetFor::Track,
+                        Chain::Bus(_) => PresetFor::Bus,
+                        Chain::Master => PresetFor::Master,
+                    };
+                    // Presets made for this kind of channel first.
+                    let mut order: Vec<usize> = (0..CHAIN_PRESETS.len()).collect();
+                    order.sort_by_key(|&pi| CHAIN_PRESETS[pi].target != here);
+                    let mut last_match = true;
+                    for pi in order {
+                        let preset = &CHAIN_PRESETS[pi];
+                        let matches = preset.target == here;
+                        if last_match && !matches {
+                            ui.separator();
+                        }
+                        last_match = matches;
+                        if ui.button(preset.name).on_hover_text(preset.hint).clicked() {
+                            actions.push(Action::AddPreset(target, pi));
+                            ui.close();
+                        }
+                    }
+                });
+            });
+        }
+    }
+    if let Some((i, op)) = op {
+        match op {
+            Op::Remove => {
+                let gone = chain.remove(i);
+                open_fx.retain(|x| *x != gone.id);
+            }
+            Op::Up => chain.swap(i, i - 1),
+            Op::Down if i + 1 < chain.len() => chain.swap(i, i + 1),
+            Op::Down => {}
+        }
+        changed = true;
+    }
+    changed
+}
+
 
 // ------------------------------------------------------------------------- the view
 
@@ -288,6 +447,19 @@ impl QtDaw {
         let full = ui.available_rect_before_wrap();
         let h = (full.height() - 14.0).max(380.0); // leave room for the scroll bar
         let send_slots = (self.session.tracks.iter().map(|t| t.sends.len()).max().unwrap_or(0) + 1).clamp(2, 8);
+        let longest_chain = self
+            .session
+            .tracks
+            .iter()
+            .map(|t| t.inserts.len())
+            .chain(self.session.buses.iter().map(|b| b.inserts.len()))
+            .chain([self.session.master_inserts.len()])
+            .max()
+            .unwrap_or(0);
+        let slots = Slots { fx: (longest_chain + 1).clamp(2, MAX_INSERTS), sends: send_slots };
+        // Keep at least ~150 px of fader travel; with many rows the mixer gets taller.
+        let rows = 1 + slots.fx + slots.sends + 1;
+        let h = h.max(rows as f32 * (ROW + 3.0) + 4.0 + 32.0 + 18.0 + 3.0 * 3.0 + 150.0 + 60.0);
         let buses: Vec<(u64, String)> = self.session.buses.iter().map(|b| (b.id, b.name.clone())).collect();
         let mut actions = Vec::new();
 
@@ -298,12 +470,12 @@ impl QtDaw {
                     ui.spacing_mut().item_spacing.x = 0.0;
                     for idx in 0..self.session.tracks.len() {
                         let (rect, _) = ui.allocate_exact_size(Vec2::new(STRIP_W, h), Sense::hover());
-                        self.track_strip(ui, idx, rect, send_slots, &buses, &mut actions);
+                        self.track_strip(ui, idx, rect, slots, &buses, &mut actions);
                     }
                     ui.add_space(10.0);
                     for idx in 0..self.session.buses.len() {
                         let (rect, _) = ui.allocate_exact_size(Vec2::new(STRIP_W, h), Sense::hover());
-                        self.bus_strip(ui, idx, rect, send_slots, &mut actions);
+                        self.bus_strip(ui, idx, rect, slots, &mut actions);
                     }
                     ui.add_space(8.0);
                     ui.vertical(|ui| {
@@ -316,7 +488,7 @@ impl QtDaw {
             });
         });
         let master = Rect::from_min_size(Pos2::new(full.right() - STRIP_W, full.top()), Vec2::new(STRIP_W, h));
-        self.master_strip(ui, master, send_slots);
+        self.master_strip(ui, master, slots, &mut actions);
 
         for action in actions {
             match action {
@@ -339,6 +511,8 @@ impl QtDaw {
                 }
                 Action::DeleteTrack(id) => self.delete_track(id),
                 Action::DeleteBus(id) => self.delete_bus(id),
+                Action::AddInsert(chain, kind) => self.add_insert(chain, kind),
+                Action::AddPreset(chain, pi) => self.add_preset(chain, &CHAIN_PRESETS[pi]),
             }
         }
     }
@@ -348,7 +522,7 @@ impl QtDaw {
         ui: &mut egui::Ui,
         idx: usize,
         rect: Rect,
-        send_slots: usize,
+        slots: Slots,
         buses: &[(u64, String)],
         actions: &mut Vec<Action>,
     ) {
@@ -358,12 +532,12 @@ impl QtDaw {
         let id = self.session.tracks[idx].id;
         let level = self.view.track_levels.get(&id).copied().unwrap_or_default();
         let bus_name = |bus: u64| buses.iter().find(|(b, _)| *b == bus).map_or("Master", |(_, n)| n.as_str()).to_string();
-        let s = strip_rects(rect, send_slots);
+        let s = strip_rects(rect, slots);
         strip_background(ui, rect);
         let uid = ui.scope_id().with(("track-strip", id));
 
         let track = &mut self.session.tracks[idx];
-        let mut changed = false;
+        let mut changed = insert_slots(ui, &s.fx, &mut track.inserts, Chain::Track(id), &mut self.view.open_fx, actions);
 
         // Input.
         place(ui, s.input, |ui| {
@@ -526,7 +700,7 @@ impl QtDaw {
         }
     }
 
-    fn bus_strip(&mut self, ui: &mut egui::Ui, idx: usize, rect: Rect, send_slots: usize, actions: &mut Vec<Action>) {
+    fn bus_strip(&mut self, ui: &mut egui::Ui, idx: usize, rect: Rect, slots: Slots, actions: &mut Vec<Action>) {
         let bus = &self.session.buses[idx];
         let id = bus.id;
         let levels = self.view.bus_levels.get(&id).copied().unwrap_or_default();
@@ -538,13 +712,13 @@ impl QtDaw {
             .map(|t| t.name.as_str())
             .collect();
         let fed_tip = if fed_by.is_empty() { "Nothing plays into this bus yet.".to_string() } else { format!("Fed by: {}", fed_by.join(", ")) };
-        let s = strip_rects(rect, send_slots);
+        let s = strip_rects(rect, slots);
         strip_background(ui, rect);
         let uid = ui.scope_id().with(("bus-strip", id));
         let color = Color32::from_rgb(0x9a, 0x8c, 0xd8);
 
         let bus = &mut self.session.buses[idx];
-        let mut changed = false;
+        let mut changed = insert_slots(ui, &s.fx, &mut bus.inserts, Chain::Bus(id), &mut self.view.open_fx, actions);
         place(ui, s.input, |ui| dim(ui, "Bus")).on_hover_text(fed_tip);
         place(ui, s.output, |ui| dim(ui, "→ Master"));
         place_centered(ui, s.pan, 30.0, |ui| {
@@ -594,10 +768,12 @@ impl QtDaw {
         }
     }
 
-    fn master_strip(&mut self, ui: &mut egui::Ui, rect: Rect, send_slots: usize) {
-        let s = strip_rects(rect, send_slots);
+    fn master_strip(&mut self, ui: &mut egui::Ui, rect: Rect, slots: Slots, actions: &mut Vec<Action>) {
+        let s = strip_rects(rect, slots);
         strip_background(ui, rect);
-        let mut changed = false;
+        let mut changed =
+            insert_slots(ui, &s.fx, &mut self.session.master_inserts, Chain::Master, &mut self.view.open_fx, actions);
+        place(ui, s.input, |ui| dim(ui, "Master")).on_hover_text("Master effects run after the master fader");
         place(ui, s.output, |ui| dim(ui, "Stereo Out"));
         place_centered(ui, s.readout, 50.0, |ui| changed |= db_readout(ui, &mut self.session.master_db).changed());
         place(ui, s.fader, |ui| changed |= fader(ui, &mut self.session.master_db, s.fader.size(), true).changed());

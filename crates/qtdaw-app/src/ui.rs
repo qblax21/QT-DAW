@@ -720,6 +720,7 @@ impl QtDaw {
     // --------------------------------------------------------------------- dialogs
 
     fn dialogs(&mut self, ctx: &egui::Context) {
+        self.fx_windows(ctx);
         if self.view.show_settings {
             let mut open = true;
             egui::Window::new("Audio Settings")
