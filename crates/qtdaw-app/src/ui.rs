@@ -97,6 +97,15 @@ fn paint_meter(painter: &egui::Painter, rect: Rect, m: &MeterState, vertical: bo
 // ------------------------------------------------------------------------- app
 
 impl eframe::App for QtDaw {
+    /// Runs before every frame, and also while the window is minimized (when something asks
+    /// for a repaint), so Claude's requests and finished recordings are handled even then.
+    fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_remote();
+        self.poll_recorder();
+        self.sync_engine();
+        self.sync_inserts();
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.tick(&ctx);

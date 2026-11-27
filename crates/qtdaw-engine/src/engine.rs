@@ -365,6 +365,43 @@ impl Engine {
     }
 }
 
+/// Play `shared` without an audio device, as fast as the CPU allows: `frames` frames from
+/// timeline position `start`, handing each block of master output (left, right, timeline
+/// position) to `sink`. Uses exactly the same mixing code as live playback. `shared` should
+/// be a private copy (see `render::shared_from_session`), not the live one.
+pub fn render_offline(shared: Arc<Shared>, sample_rate: u32, start: i64, frames: usize, mut sink: impl FnMut(&[f32], &[f32], i64)) {
+    const BLOCK: usize = 1024;
+    let (_in_prod, in_cons) = HeapRb::<f32>::new(16).split();
+    let (rec_prod, _rec_cons) = HeapRb::<f32>::new(16).split();
+    shared.click_on.store(false, Ordering::Relaxed);
+    let mut rt = Rt::new(
+        shared,
+        Arc::new(Meters::new(1)),
+        (1, 2),
+        sample_rate as f64,
+        in_cons,
+        rec_prod,
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicU64::new(0)),
+    );
+    rt.playhead = start;
+    rt.set_mode(Mode::Playing);
+    let mut out = vec![0.0f32; 2 * BLOCK];
+    let (mut l, mut r) = (vec![0.0f32; BLOCK], vec![0.0f32; BLOCK]);
+    let mut done = 0;
+    while done < frames {
+        let n = BLOCK.min(frames - done);
+        let pos = rt.playhead;
+        rt.process(&mut out[..2 * n], Duration::ZERO);
+        for (i, f) in out[..2 * n].chunks_exact(2).enumerate() {
+            l[i] = f[0];
+            r[i] = f[1];
+        }
+        sink(&l[..n], &r[..n], pos);
+        done += n;
+    }
+}
+
 fn duration_frames(d: Duration, sr: usize) -> u64 {
     (d.as_secs_f64() * sr as f64).round() as u64
 }
@@ -770,7 +807,7 @@ fn flush_denormals() {
 
 /// Constant-power pan: a centered track is -3 dB in each speaker, so it sounds equally
 /// loud wherever you pan it.
-fn pan_gains(pan: f32) -> (f32, f32) {
+pub(crate) fn pan_gains(pan: f32) -> (f32, f32) {
     let angle = (pan.clamp(-1.0, 1.0) + 1.0) * std::f32::consts::FRAC_PI_4;
     (angle.cos(), angle.sin())
 }
@@ -790,7 +827,7 @@ fn mix_into(src: &[f32], gain: f32, (pl, pr): (f32, f32), dl: &mut [f32], dr: &m
 
 /// Copy the clips overlapping `[pos, pos + out.len())` into `out`. Later clips overwrite
 /// earlier ones, so the newest take is the one you hear.
-fn render_clips(clips: &[ClipRt], pos: i64, out: &mut [f32]) {
+pub(crate) fn render_clips(clips: &[ClipRt], pos: i64, out: &mut [f32]) {
     let end = pos + out.len() as i64;
     for clip in clips {
         let c_start = clip.start;

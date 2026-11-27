@@ -115,6 +115,10 @@ pub struct QtDaw {
     pub audio: HashMap<String, Arc<ClipAudio>>,
     pub view: View,
     pub status: Option<(String, Instant)>,
+    /// Requests from Claude (see `remote.rs` and `claude.rs`).
+    pub remote: crate::remote::Remote,
+    /// Whether this session's pre-Claude backup has been written.
+    pub claude_backup: bool,
 }
 
 impl QtDaw {
@@ -155,6 +159,8 @@ impl QtDaw {
             },
             settings,
             status: None,
+            remote: crate::remote::start(cc.egui_ctx.clone()),
+            claude_backup: false,
         };
         let reopened = app
             .settings
@@ -168,6 +174,9 @@ impl QtDaw {
             app.rebuild_tracks();
         }
         app.restart_engine();
+        if let Some(e) = app.remote.error.clone() {
+            app.say(e);
+        }
         app
     }
 
@@ -565,6 +574,7 @@ impl QtDaw {
         let mut s = Session::new(&name, sample_rate);
         s.add_track(Some("Audio 1".into()), 0);
         self.clear_fx();
+        self.claude_backup = false;
         self.session = s;
         self.folder = None;
         self.audio.clear();
@@ -599,6 +609,7 @@ impl QtDaw {
             }
         }
         self.clear_fx();
+        self.claude_backup = false;
         self.session = session;
         self.folder = Some(folder.to_path_buf());
         self.dirty = false;
@@ -622,10 +633,9 @@ impl QtDaw {
 
     // ---------------------------------------------------------------- per-frame
 
+    /// Meters and repaint timing. (Requests, recordings and engine syncing run in
+    /// `App::logic`, just before this.)
     pub fn tick(&mut self, ctx: &egui::Context) {
-        self.poll_recorder();
-        self.sync_engine();
-        self.sync_inserts();
 
         let now = ctx.input(|i| i.time);
         if let Some(engine) = &self.engine {

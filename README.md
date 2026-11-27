@@ -12,7 +12,7 @@ and mixing/mastering, with a Claude MCP server so Claude can do first-pass mixes
 | **1. Recorder** (done) | App window; record any number of armed tracks to disk, playback, click + count-in, tempo, input monitoring, volume/pan/mute/solo, save/open sessions |
 | **2. Mixer** (done) | Mixer view (X), aux buses, pre/post-fader sends, track output routing, console-style faders, meters with peak hold and clip lights |
 | **3. Built-in effects** (done) | Channel EQ, compressor, noise gate, de-esser, limiter, delay, reverb on tracks, buses and the master; chain presets (vocal, drums, reverb bus, master...) |
-| 4. Claude MCP | Analysis (loudness, spectrum, masking) + mix controls for Claude |
+| **4. Claude MCP** (done) | Claude can analyze the mix (loudness, peaks, tone, masking) and set faders, pans, sends, routing and effects |
 | 5. Editing | Cut, move, fades, crossfades (non-destructive), undo |
 | 6. X32 control surface | X32 faders/mutes drive QT DAW via its DAW Remote (Mackie/HUI) mode |
 | 7. MIDI + instruments | Drum sampler with our own kits, simple synths |
@@ -22,6 +22,7 @@ and mixing/mastering, with a Claude MCP server so Claude can do first-pass mixes
 
 - `crates/qtdaw-app` — the desktop app (`qtdaw.exe`), built with egui
 - `crates/qtdaw-engine` — audio engine: devices, transport, click, recording, sessions
+- `crates/qtdaw-mcp` — `qtdaw-mcp.exe`, the MCP server that connects Claude to the running app
 - `crates/qtdaw-probe` — command-line hardware test tool
 - `third_party/asio-sys` — patched copy of the ASIO bindings (see "QT DAW patch" in its `build.rs`)
 - `tools/build.ps1` — build script (sets up the MinGW toolchain)
@@ -53,7 +54,7 @@ The first ASIO build downloads the Steinberg ASIO SDK automatically.
   - **Buses** (`+ Bus`, or "New Bus" in any send/output menu) are stereo aux channels.
     Set a track's **output** to a bus to group tracks (all drums → "Drums" bus, one fader).
     Use a **send** for effects like reverb: the track still plays normally, and a copy goes to
-    the bus at the send knob's level. Real effects arrive in Phase 3.
+    the bus at the send knob's level, and a Reverb on the bus does the rest.
   - Sends are post-fader (follow the track's fader) unless you tick **Pre-fader** in the
     send's menu (yellow knob). Right-click a strip's name to delete it.
   - Faders: drag (hold **Shift** for fine moves), double-click for 0 dB, or type a value in
@@ -82,6 +83,46 @@ The first ASIO build downloads the Steinberg ASIO SDK automatically.
 - Recordings are shifted earlier by the measured driver latency so they line up with what
   you heard. If they still land early/late, adjust **Recording offset** in Audio Settings.
 
+## Mixing with Claude
+
+QT DAW comes with `qtdaw-mcp.exe`, an MCP server: a small program Claude starts so it can
+work in the session that's open in QT DAW. Claude can:
+
+- **Read** the session (tracks, buses, routing, effects and their settings).
+- **Analyze** the mix: it plays the song offline (with all effects, in a second or two) and
+  measures loudness (LUFS, like streaming services), loudness range, true peak, clipping,
+  tone per frequency region, stereo correlation, and **masking**: tracks that are both
+  strong at the same frequencies at the same time (e.g. bass and keys fighting at 250 Hz).
+- **Mix**: set volume/pan/mute/solo, route tracks to buses, add buses and sends, add, change,
+  bypass or remove effects, add chain presets, play/stop, and save (only when you say so).
+
+Connect it once:
+
+- **Claude Desktop** (the chat app): Settings → Developer → Edit Config, and put this in
+  `claude_desktop_config.json`, then restart Claude Desktop:
+
+  ```json
+  { "mcpServers": { "qtdaw": { "command": "D:\\qtdaw\\target\\debug\\qtdaw-mcp.exe" } } }
+  ```
+
+- **Claude Code**: run this once in a terminal:
+
+  ```powershell
+  claude mcp add --scope user qtdaw -- D:\qtdaw\target\debug\qtdaw-mcp.exe
+  ```
+
+Then open your session in QT DAW and ask Claude something like *"Do a first-pass mix of
+my song in QT DAW"* or *"Why does my vocal sound buried?"*.
+
+- QT DAW must be running (it can be minimized). The status bar shows each change Claude
+  makes ("Claude: Bass: volume -3.0 dB").
+- Before Claude's first change in a session, QT DAW saves a copy of the session as it was:
+  `session.before-claude.qtdaw` in the session folder. To go back, close QT DAW, delete
+  `session.qtdaw` and rename that file to `session.qtdaw`.
+- Claude can't record, delete tracks or touch your audio files.
+- The connection only accepts programs on this computer (127.0.0.1, port 47390; set the
+  `QTDAW_PORT` environment variable for both programs to change it).
+
 ## Hardware tests
 
 ```powershell
@@ -106,3 +147,6 @@ For the X32 the device name will be something like `"X-USB"`.
 - Buses feed the master only (no bus → bus routing yet); up to 32 buses per session.
 - Tracks are mono, so effects on a track are mono too (reverb/delay are stereo on a bus).
 - No delay compensation yet: the limiter delays its channel by 1.5 ms (harmless on the master).
+- Claude's changes can't be undone yet (Phase 5); see the backup file under "Mixing with Claude".
+- Claude's per-track numbers include the track's effects, fader and bus fader, but not bus or
+  master effects. Analysis ignores solo (so it always hears the whole mix).

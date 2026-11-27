@@ -1,5 +1,8 @@
 //! QT DAW audio engine.
 //!
+//! Phase 4 adds [`analysis`] (loudness, true peak, spectrum), [`render`] (offline playback)
+//! and [`mixcheck`] (the mix report Claude uses).
+//!
 //! Phase 3 adds [`fx`] (built-in effects and chain presets).
 //!
 //! Phase 1 adds [`engine`] (transport, click, monitoring, playback), [`recorder`] (disk
@@ -15,14 +18,17 @@
 //! and (almost) no memory allocation. The audio callback has a hard deadline of a few
 //! milliseconds; missing it is an audible click ("xrun").
 
+pub mod analysis;
 pub mod clip;
 pub mod devices;
 pub mod engine;
 pub mod fx;
 pub mod io;
 pub mod meter;
+pub mod mixcheck;
 pub mod passthrough;
 pub mod recorder;
+pub mod render;
 pub mod session;
 
 /// Convert a linear amplitude (0.0..=1.0 is full scale) to decibels relative to full scale.

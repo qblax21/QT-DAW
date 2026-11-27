@@ -3,12 +3,15 @@
 //! - `app.rs`: the app state and everything that changes the session or engine.
 //! - `ui.rs`: drawing the window (control bar, tracks, timeline, dialogs).
 //! - `settings.rs`: per-computer settings (audio device, last session).
+//! - `remote.rs` + `claude.rs`: the local connection Claude uses, and its mixing tools.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod claude;
 mod fxui;
 mod mixer;
+mod remote;
 mod settings;
 mod ui;
 

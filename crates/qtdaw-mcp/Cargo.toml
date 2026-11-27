@@ -1,0 +1,9 @@
+[package]
+name = "qtdaw-mcp"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "MCP server that lets Claude analyze and mix in QT DAW"
+
+[dependencies]
+serde_json = "1.0.154"
