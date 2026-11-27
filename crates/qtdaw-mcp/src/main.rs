@@ -43,6 +43,8 @@ fn main() {
     let mut out = std::io::stdout().lock();
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
+        // Some tools put an invisible byte-order mark before the first line.
+        let line = line.trim_start_matches('\u{feff}');
         if line.trim().is_empty() {
             continue;
         }

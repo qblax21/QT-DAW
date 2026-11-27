@@ -96,19 +96,26 @@ work in the session that's open in QT DAW. Claude can:
 - **Mix**: set volume/pan/mute/solo, route tracks to buses, add buses and sends, add, change,
   bypass or remove effects, add chain presets, play/stop, and save (only when you say so).
 
-Connect it once:
+Connect it once. First copy the connector to its own folder, so Claude running it never
+blocks a rebuild (`tools\build.ps1` keeps that copy up to date afterwards):
+
+```powershell
+New-Item -ItemType Directory -Force "$env:LOCALAPPDATA\QT DAW"; Copy-Item target\debug\qtdaw-mcp.exe "$env:LOCALAPPDATA\QT DAW\"
+```
+
+Then:
 
 - **Claude Desktop** (the chat app): Settings → Developer → Edit Config, and put this in
   `claude_desktop_config.json`, then restart Claude Desktop:
 
   ```json
-  { "mcpServers": { "qtdaw": { "command": "D:\\qtdaw\\target\\debug\\qtdaw-mcp.exe" } } }
+  { "mcpServers": { "qtdaw": { "command": "C:\\Users\\<you>\\AppData\\Local\\QT DAW\\qtdaw-mcp.exe" } } }
   ```
 
 - **Claude Code**: run this once in a terminal:
 
   ```powershell
-  claude mcp add --scope user qtdaw -- D:\qtdaw\target\debug\qtdaw-mcp.exe
+  claude mcp add --scope user qtdaw -- "$env:LOCALAPPDATA\QT DAW\qtdaw-mcp.exe"
   ```
 
 Then open your session in QT DAW and ask Claude something like *"Do a first-pass mix of

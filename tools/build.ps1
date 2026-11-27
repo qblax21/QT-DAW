@@ -32,6 +32,16 @@ if (-not $NoAsio) { $cargoArgs += @('--features', 'qtdaw-probe/asio,qtdaw-app/as
 & cargo build --workspace @cargoArgs
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+# Claude runs its own copy of the MCP connector (so it never locks the build output).
+# Refresh that copy if it's installed; if Claude is using it right now, keep the old one.
+$mcpCopy = Join-Path $env:LOCALAPPDATA 'QT DAW\qtdaw-mcp.exe'
+$mcpBuilt = Join-Path (Get-Location) ("target\{0}\qtdaw-mcp.exe" -f $(if ($Release) { 'release' } else { 'debug' }))
+if ((Test-Path $mcpCopy) -and (Test-Path $mcpBuilt) -and
+    ((Get-FileHash $mcpCopy).Hash -ne (Get-FileHash $mcpBuilt).Hash)) {
+    try { Copy-Item $mcpBuilt $mcpCopy -Force -ErrorAction Stop; Write-Host "Updated $mcpCopy" }
+    catch { Write-Warning "Claude is using $mcpCopy; quit Claude and build again to update it." }
+}
+
 if ($Test) {
     & cargo test --workspace @cargoArgs
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
